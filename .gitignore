@@ -1,0 +1,36 @@
+# Data and experiment outputs
+data/*
+!data/.gitkeep
+runs/
+jepa_wsss/pretrained/*
+!jepa_wsss/pretrained/.gitkeep
+
+# Large local artifacts
+*.zip
+*.rar
+*.tar
+*.tar.gz
+*.7z
+
+# Local notes/plans/summaries
+*.md
+!README.md
+
+# Python/cache artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environments and local config
+.venv/
+venv/
+.env
+.env.*
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
