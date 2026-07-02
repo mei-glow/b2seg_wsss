@@ -13,9 +13,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from jepa_wsss.datasets import CLASS_NAMES, SegmentationDataset
+from jepa_wsss.datasets import CLASS_NAMES, SegmentationDataset, pil_to_normalized_tensor
 from jepa_wsss.metrics import SegmentationMeter
-from jepa_wsss.models import PrototypeWSSSModel
+from jepa_wsss.models import DualRouteLinearWSSSModel, LinearWSSSModel, PrototypeWSSSModel
 
 
 def parse_prototype_counts(value: object, num_classes: int) -> list[int] | None:
@@ -110,6 +110,7 @@ def main() -> None:
     )
     prototype_gating = bool(saved_args.get("prototype_gating", False))
     gate_init = float(saved_args.get("gate_init", 2.0))
+    prototype_dropout = float(saved_args.get("prototype_dropout", 0.0))
     prototype_aggregation = saved_args.get("prototype_aggregation", "max")
     prototype_lse_tau = float(saved_args.get("prototype_lse_tau", saved_args.get("lse_tau", 1.0)))
     refine_head = bool(saved_args.get("refine_head", False))
@@ -120,32 +121,92 @@ def main() -> None:
     fusion_layers = saved_args.get("fusion_layers")
     fusion_mode = saved_args.get("fusion_mode", "weighted_sum")
     fusion_init = saved_args.get("fusion_init", "average")
+    dense_prototype_scale = int(saved_args.get("dense_prototype_scale", 1))
+    patch_stride = saved_args.get("patch_stride")
+    patch_stride = None if patch_stride is None else int(patch_stride)
+    patch_padding = int(saved_args.get("patch_padding", 0))
+    prototype_pooling = saved_args.get("prototype_pooling", "max")
+    prototype_topk_frac = float(saved_args.get("prototype_topk_frac", 0.05))
+    prototype_mix_alpha = float(saved_args.get("prototype_mix_alpha", 0.5))
+    prototype_multiscale = bool(saved_args.get("prototype_multiscale", False))
+    prototype_scale_branches = saved_args.get("prototype_scale_branches", "identity,local,coarse")
+    prototype_scale_init = saved_args.get("prototype_scale_init", "identity")
+    prototype_scale_residual_init = float(saved_args.get("prototype_scale_residual_init", 0.05))
+    prototype_scale_mode = saved_args.get("prototype_scale_mode", "mixture")
+    prototype_scale_alpha_init = float(saved_args.get("prototype_scale_alpha_init", 0.02))
+    image_mean = tuple(float(x) for x in saved_args.get("image_mean", (0.485, 0.456, 0.406)))
+    image_std = tuple(float(x) for x in saved_args.get("image_std", (0.229, 0.224, 0.225)))
     device = torch.device(args.device)
 
-    model = PrototypeWSSSModel(
-        model_name=model_name,
-        checkpoint_path=pretrain_checkpoint,
-        num_classes=num_classes,
-        prototypes_per_class=prototypes_per_class,
-        prototype_counts=prototype_counts,
-        prototype_gating=prototype_gating,
-        gate_init=gate_init,
-        prototype_aggregation=prototype_aggregation,
-        lse_tau=prototype_lse_tau,
-        refine_head=refine_head,
-        refine_dim=refine_dim,
-        refine_scale=refine_scale,
-        refine_pooling=refine_pooling,
-        refine_topk_frac=refine_topk_frac,
-        grad_checkpointing=False,
-        fusion_layers=fusion_layers,
-        fusion_mode=fusion_mode,
-        fusion_init=fusion_init,
-    )
+    if saved_args.get("model_type") == "dual_route_linear":
+        model = DualRouteLinearWSSSModel(
+            model_name=model_name,
+            checkpoint_path=pretrain_checkpoint,
+            num_classes=num_classes,
+            route_layers=saved_args.get("route_layers", "all"),
+            variant=saved_args.get("variant", "dual_quality"),
+            topk_frac=float(saved_args.get("topk_frac", 0.05)),
+            spatial_weight=float(saved_args.get("spatial_weight", 0.5)),
+            quality_hidden_dim=int(saved_args.get("quality_hidden_dim", 32)),
+            semantic_init=saved_args.get("semantic_init", "final"),
+            spatial_init=saved_args.get("spatial_init", "uniform"),
+            output_mode=saved_args.get("output_mode", "spatial"),
+            output_fuse_alpha=float(saved_args.get("output_fuse_alpha", 0.5)),
+            grad_checkpointing=False,
+        )
+    elif saved_args.get("model_type") == "linear_wsss":
+        model = LinearWSSSModel(
+            model_name=model_name,
+            checkpoint_path=pretrain_checkpoint,
+            num_classes=num_classes,
+            grad_checkpointing=False,
+            fusion_layers=fusion_layers,
+            fusion_mode=fusion_mode,
+            fusion_init=fusion_init,
+            patch_stride=patch_stride,
+            patch_padding=patch_padding,
+            pooling=saved_args.get("pooling", "max"),
+            topk_frac=float(saved_args.get("topk_frac", 0.05)),
+        )
+    else:
+        model = PrototypeWSSSModel(
+            model_name=model_name,
+            checkpoint_path=pretrain_checkpoint,
+            num_classes=num_classes,
+            prototypes_per_class=prototypes_per_class,
+            prototype_counts=prototype_counts,
+            prototype_gating=prototype_gating,
+            gate_init=gate_init,
+            prototype_dropout=prototype_dropout,
+            prototype_aggregation=prototype_aggregation,
+            lse_tau=prototype_lse_tau,
+            refine_head=refine_head,
+            refine_dim=refine_dim,
+            refine_scale=refine_scale,
+            refine_pooling=refine_pooling,
+            refine_topk_frac=refine_topk_frac,
+            grad_checkpointing=False,
+            fusion_layers=fusion_layers,
+            fusion_mode=fusion_mode,
+            fusion_init=fusion_init,
+            dense_prototype_scale=dense_prototype_scale,
+            patch_stride=patch_stride,
+            patch_padding=patch_padding,
+            prototype_pooling=prototype_pooling,
+            prototype_topk_frac=prototype_topk_frac,
+            prototype_mix_alpha=prototype_mix_alpha,
+            prototype_multiscale=prototype_multiscale,
+            prototype_scale_branches=prototype_scale_branches,
+            prototype_scale_init=prototype_scale_init,
+            prototype_scale_residual_init=prototype_scale_residual_init,
+            prototype_scale_mode=prototype_scale_mode,
+            prototype_scale_alpha_init=prototype_scale_alpha_init,
+        )
     model.load_state_dict(checkpoint["model"], strict=True)
     model.to(device)
 
-    dataset_obj = SegmentationDataset(data_root, dataset, split=args.split)
+    transform = lambda image: pil_to_normalized_tensor(image, mean=image_mean, std=image_std)
+    dataset_obj = SegmentationDataset(data_root, dataset, split=args.split, transform=transform)
     loader = DataLoader(
         dataset_obj,
         batch_size=args.batch_size,

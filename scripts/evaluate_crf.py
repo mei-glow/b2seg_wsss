@@ -14,9 +14,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from jepa_wsss.datasets import CLASS_NAMES, IMAGENET_MEAN, IMAGENET_STD, SegmentationDataset
+from jepa_wsss.datasets import CLASS_NAMES, IMAGENET_MEAN, IMAGENET_STD, SegmentationDataset, pil_to_normalized_tensor
 from jepa_wsss.metrics import SegmentationMeter
-from jepa_wsss.models import PrototypeWSSSModel
+from jepa_wsss.models import DualRouteLinearWSSSModel, LinearWSSSModel, PrototypeWSSSModel
 from scripts.evaluate import parse_prototype_counts
 
 
@@ -55,9 +55,13 @@ def logits_from_outputs(outputs: dict[str, torch.Tensor], size: tuple[int, int],
     return logits_from_patch_logits(outputs["patch_logits"], size)
 
 
-def denormalize_image(image: torch.Tensor) -> np.ndarray:
-    mean = torch.tensor(IMAGENET_MEAN, dtype=image.dtype, device=image.device).view(3, 1, 1)
-    std = torch.tensor(IMAGENET_STD, dtype=image.dtype, device=image.device).view(3, 1, 1)
+def denormalize_image(
+    image: torch.Tensor,
+    mean_values: tuple[float, float, float] = IMAGENET_MEAN,
+    std_values: tuple[float, float, float] = IMAGENET_STD,
+) -> np.ndarray:
+    mean = torch.tensor(mean_values, dtype=image.dtype, device=image.device).view(3, 1, 1)
+    std = torch.tensor(std_values, dtype=image.dtype, device=image.device).view(3, 1, 1)
     image = (image * std + mean).clamp(0.0, 1.0)
     return (image.permute(1, 2, 0).detach().cpu().numpy() * 255.0).astype(np.uint8)
 
@@ -89,7 +93,7 @@ def dense_crf_predict(
     return refined.argmax(axis=0).astype(np.int64)
 
 
-def build_model_from_checkpoint(checkpoint: dict[str, object], checkpoint_path: Path, dataset: str, device: torch.device) -> PrototypeWSSSModel:
+def build_model_from_checkpoint(checkpoint: dict[str, object], checkpoint_path: Path, dataset: str, device: torch.device) -> torch.nn.Module:
     saved_args = checkpoint.get("args", {})
     model_name = saved_args.get("model", "deit_base_patch16_224")
     pretrain_checkpoint = saved_args.get("checkpoint")
@@ -98,26 +102,72 @@ def build_model_from_checkpoint(checkpoint: dict[str, object], checkpoint_path: 
         saved_args.get("resolved_prototype_counts", saved_args.get("prototype_counts")),
         num_classes,
     )
-    model = PrototypeWSSSModel(
-        model_name=model_name,
-        checkpoint_path=pretrain_checkpoint,
-        num_classes=num_classes,
-        prototypes_per_class=int(saved_args.get("prototypes_per_class", 4)),
-        prototype_counts=prototype_counts,
-        prototype_gating=bool(saved_args.get("prototype_gating", False)),
-        gate_init=float(saved_args.get("gate_init", 2.0)),
-        prototype_aggregation=saved_args.get("prototype_aggregation", "max"),
-        lse_tau=float(saved_args.get("prototype_lse_tau", saved_args.get("lse_tau", 1.0))),
-        refine_head=bool(saved_args.get("refine_head", False)),
-        refine_dim=int(saved_args.get("refine_dim", 256)),
-        refine_scale=int(saved_args.get("refine_scale", 2)),
-        refine_pooling=saved_args.get("refine_pooling", "topk"),
-        refine_topk_frac=float(saved_args.get("refine_topk_frac", 0.05)),
-        grad_checkpointing=False,
-        fusion_layers=saved_args.get("fusion_layers"),
-        fusion_mode=saved_args.get("fusion_mode", "weighted_sum"),
-        fusion_init=saved_args.get("fusion_init", "average"),
-    )
+    patch_stride = saved_args.get("patch_stride")
+    patch_stride = None if patch_stride is None else int(patch_stride)
+    if saved_args.get("model_type") == "dual_route_linear":
+        model = DualRouteLinearWSSSModel(
+            model_name=model_name,
+            checkpoint_path=pretrain_checkpoint,
+            num_classes=num_classes,
+            route_layers=saved_args.get("route_layers", "all"),
+            variant=saved_args.get("variant", "dual_quality"),
+            topk_frac=float(saved_args.get("topk_frac", 0.05)),
+            spatial_weight=float(saved_args.get("spatial_weight", 0.5)),
+            quality_hidden_dim=int(saved_args.get("quality_hidden_dim", 32)),
+            semantic_init=saved_args.get("semantic_init", "final"),
+            spatial_init=saved_args.get("spatial_init", "uniform"),
+            output_mode=saved_args.get("output_mode", "spatial"),
+            output_fuse_alpha=float(saved_args.get("output_fuse_alpha", 0.5)),
+            grad_checkpointing=False,
+        )
+    elif saved_args.get("model_type") == "linear_wsss":
+        model = LinearWSSSModel(
+            model_name=model_name,
+            checkpoint_path=pretrain_checkpoint,
+            num_classes=num_classes,
+            grad_checkpointing=False,
+            fusion_layers=saved_args.get("fusion_layers"),
+            fusion_mode=saved_args.get("fusion_mode", "weighted_sum"),
+            fusion_init=saved_args.get("fusion_init", "average"),
+            patch_stride=patch_stride,
+            patch_padding=int(saved_args.get("patch_padding", 0)),
+            pooling=saved_args.get("pooling", "max"),
+            topk_frac=float(saved_args.get("topk_frac", 0.05)),
+        )
+    else:
+        model = PrototypeWSSSModel(
+            model_name=model_name,
+            checkpoint_path=pretrain_checkpoint,
+            num_classes=num_classes,
+            prototypes_per_class=int(saved_args.get("prototypes_per_class", 4)),
+            prototype_counts=prototype_counts,
+            prototype_gating=bool(saved_args.get("prototype_gating", False)),
+            gate_init=float(saved_args.get("gate_init", 2.0)),
+            prototype_dropout=float(saved_args.get("prototype_dropout", 0.0)),
+            prototype_aggregation=saved_args.get("prototype_aggregation", "max"),
+            lse_tau=float(saved_args.get("prototype_lse_tau", saved_args.get("lse_tau", 1.0))),
+            refine_head=bool(saved_args.get("refine_head", False)),
+            refine_dim=int(saved_args.get("refine_dim", 256)),
+            refine_scale=int(saved_args.get("refine_scale", 2)),
+            refine_pooling=saved_args.get("refine_pooling", "topk"),
+            refine_topk_frac=float(saved_args.get("refine_topk_frac", 0.05)),
+            grad_checkpointing=False,
+            fusion_layers=saved_args.get("fusion_layers"),
+            fusion_mode=saved_args.get("fusion_mode", "weighted_sum"),
+            fusion_init=saved_args.get("fusion_init", "average"),
+            dense_prototype_scale=int(saved_args.get("dense_prototype_scale", 1)),
+            patch_stride=patch_stride,
+            patch_padding=int(saved_args.get("patch_padding", 0)),
+            prototype_pooling=saved_args.get("prototype_pooling", "max"),
+            prototype_topk_frac=float(saved_args.get("prototype_topk_frac", 0.05)),
+            prototype_mix_alpha=float(saved_args.get("prototype_mix_alpha", 0.5)),
+            prototype_multiscale=bool(saved_args.get("prototype_multiscale", False)),
+            prototype_scale_branches=saved_args.get("prototype_scale_branches", "identity,local,coarse"),
+            prototype_scale_init=saved_args.get("prototype_scale_init", "identity"),
+            prototype_scale_residual_init=float(saved_args.get("prototype_scale_residual_init", 0.05)),
+            prototype_scale_mode=saved_args.get("prototype_scale_mode", "mixture"),
+            prototype_scale_alpha_init=float(saved_args.get("prototype_scale_alpha_init", 0.02)),
+        )
     model.load_state_dict(checkpoint["model"], strict=True)
     model.to(device)
     print(f"loaded_checkpoint={checkpoint_path}", flush=True)
@@ -131,13 +181,16 @@ def evaluate(args: argparse.Namespace) -> dict[str, object]:
     saved_args = checkpoint.get("args", {})
     data_root = args.data_root or saved_args.get("data_root", "data")
     dataset = args.dataset or saved_args.get("dataset", "bcss")
+    image_mean = tuple(float(x) for x in saved_args.get("image_mean", IMAGENET_MEAN))
+    image_std = tuple(float(x) for x in saved_args.get("image_std", IMAGENET_STD))
     num_classes = len(CLASS_NAMES[dataset])
     device = torch.device(args.device)
 
     model = build_model_from_checkpoint(checkpoint, ckpt_path, dataset, device)
     model.eval()
 
-    dataset_obj = SegmentationDataset(data_root, dataset, split=args.split)
+    transform = lambda image: pil_to_normalized_tensor(image, mean=image_mean, std=image_std)
+    dataset_obj = SegmentationDataset(data_root, dataset, split=args.split, transform=transform)
     loader = DataLoader(
         dataset_obj,
         batch_size=args.batch_size,
@@ -159,7 +212,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, object]:
 
         probs = F.softmax(logits / args.softmax_temp, dim=1).detach().cpu().numpy()
         for item_idx in range(images.shape[0]):
-            image_rgb = denormalize_image(images[item_idx])
+            image_rgb = denormalize_image(images[item_idx], image_mean, image_std)
             crf_pred = dense_crf_predict(
                 image_rgb=image_rgb,
                 probs=probs[item_idx],
