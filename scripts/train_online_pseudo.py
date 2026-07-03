@@ -48,6 +48,27 @@ class TrainTransform:
         return pil_to_normalized_tensor(image, mean=self.mean, std=self.std)
 
 
+def strong_augment_tensor(
+    images: torch.Tensor,
+    brightness: float,
+    contrast: float,
+    noise: float,
+) -> torch.Tensor:
+    out = images
+    if brightness > 0.0:
+        shift = torch.empty(out.shape[0], 1, 1, 1, device=out.device, dtype=out.dtype)
+        shift.uniform_(-float(brightness), float(brightness))
+        out = out + shift
+    if contrast > 0.0:
+        mean = out.mean(dim=(2, 3), keepdim=True)
+        scale = torch.empty(out.shape[0], 1, 1, 1, device=out.device, dtype=out.dtype)
+        scale.uniform_(1.0 - float(contrast), 1.0 + float(contrast))
+        out = (out - mean) * scale + mean
+    if noise > 0.0:
+        out = out + torch.randn_like(out) * float(noise)
+    return out
+
+
 def seed_everything(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -87,6 +108,19 @@ def build_scheduler(
         return min_lr_ratio + (1.0 - min_lr_ratio) * float(cosine)
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
+def ramp_value(epoch: int, warmup_epochs: float, ramp_epochs: float) -> float:
+    if epoch <= float(warmup_epochs):
+        return 0.0
+    if ramp_epochs <= 0:
+        return 1.0
+    return max(0.0, min(1.0, (float(epoch) - float(warmup_epochs)) / float(ramp_epochs)))
+
+
+def interpolate_thresholds(start: torch.Tensor, end: torch.Tensor, scale: float) -> torch.Tensor:
+    scale = max(0.0, min(1.0, float(scale)))
+    return start.to(end.device, end.dtype) * (1.0 - scale) + end * scale
 
 
 def compute_fast_pos_weight(
@@ -355,6 +389,163 @@ def update_ema(student: torch.nn.Module, teacher: torch.nn.Module, decay: float)
 
 
 @torch.no_grad()
+def cap_pseudo_keep(
+    keep: torch.Tensor,
+    pseudo: torch.Tensor,
+    probs: torch.Tensor,
+    labels: torch.Tensor,
+    max_frac: float,
+    mode: str,
+    target_slack: float,
+    protect_floor_ratio: float,
+    rescue_frac: float,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    max_frac = float(max_frac)
+    if max_frac >= 1.0:
+        return keep, {"pseudo_cap_removed": 0.0, "pseudo_cap_target": 1.0}
+    if max_frac <= 0.0:
+        removed = keep.float().mean()
+        return torch.zeros_like(keep), {"pseudo_cap_removed": float(removed.detach().cpu()), "pseudo_cap_target": 0.0}
+    if mode not in {"global", "target", "protected", "protected_rescue"}:
+        raise ValueError(f"Unknown pseudo kept cap mode: {mode}")
+
+    capped = keep.clone()
+    selected_conf = probs.gather(dim=-1, index=pseudo.unsqueeze(-1)).squeeze(-1)
+    batch, num_tokens = keep.shape
+    max_keep_total = max(1, int(round(num_tokens * max_frac)))
+
+    if mode == "global":
+        for batch_idx in range(batch):
+            valid_idx = torch.nonzero(capped[batch_idx], as_tuple=False).flatten()
+            if valid_idx.numel() <= max_keep_total:
+                continue
+            scores = selected_conf[batch_idx, valid_idx]
+            keep_local = scores.topk(max_keep_total).indices
+            next_mask = torch.zeros_like(capped[batch_idx])
+            next_mask[valid_idx[keep_local]] = True
+            capped[batch_idx] = next_mask
+    elif mode == "target":
+        class_fraction = []
+        for class_idx in range(labels.shape[1]):
+            class_fraction.append(((pseudo == class_idx) & capped).float().mean())
+        class_fraction_tensor = torch.stack(class_fraction)
+        target_fraction = target_fraction_from_labels(labels, class_fraction_tensor, 0.0)
+        class_caps = ((target_fraction + float(target_slack)).clamp_min(0.0) * num_tokens).ceil().to(torch.long)
+        class_caps = class_caps.clamp_min(1)
+        for batch_idx in range(batch):
+            next_mask = capped[batch_idx].clone()
+            present_classes = torch.nonzero(labels[batch_idx] > 0, as_tuple=False).flatten()
+            for class_idx in present_classes.tolist():
+                class_idx_tensor = torch.nonzero(
+                    capped[batch_idx] & (pseudo[batch_idx] == class_idx),
+                    as_tuple=False,
+                ).flatten()
+                cap = int(class_caps[class_idx].item())
+                if class_idx_tensor.numel() <= cap:
+                    continue
+                scores = selected_conf[batch_idx, class_idx_tensor]
+                keep_local = scores.topk(cap).indices
+                drop_mask = torch.ones(class_idx_tensor.numel(), dtype=torch.bool, device=keep.device)
+                drop_mask[keep_local] = False
+                next_mask[class_idx_tensor[drop_mask]] = False
+            valid_idx = torch.nonzero(next_mask, as_tuple=False).flatten()
+            if valid_idx.numel() > max_keep_total:
+                scores = selected_conf[batch_idx, valid_idx]
+                keep_local = scores.topk(max_keep_total).indices
+                final_mask = torch.zeros_like(next_mask)
+                final_mask[valid_idx[keep_local]] = True
+                next_mask = final_mask
+            capped[batch_idx] = next_mask
+    else:
+        class_fraction = []
+        for class_idx in range(labels.shape[1]):
+            class_fraction.append(((pseudo == class_idx) & capped).float().mean())
+        class_fraction_tensor = torch.stack(class_fraction)
+        target_fraction = target_fraction_from_labels(labels, class_fraction_tensor, 0.0)
+        floor_ratio = max(0.0, min(1.0, float(protect_floor_ratio)))
+        class_floors = (target_fraction.clamp_min(0.0) * floor_ratio * num_tokens).ceil().to(torch.long).clamp_min(1)
+        for batch_idx in range(batch):
+            present_classes = torch.nonzero(labels[batch_idx] > 0, as_tuple=False).flatten()
+            next_mask = capped[batch_idx].clone()
+            while int(next_mask.sum().item()) > max_keep_total:
+                class_counts = torch.stack(
+                    [((pseudo[batch_idx] == class_idx) & next_mask).sum() for class_idx in range(labels.shape[1])]
+                ).to(torch.float32)
+                pressure = class_counts / float(num_tokens) - target_fraction.to(class_counts.device)
+                eligible = torch.zeros_like(pressure, dtype=torch.bool)
+                for class_idx in present_classes.tolist():
+                    eligible[class_idx] = class_counts[class_idx] > class_floors[class_idx].to(class_counts.device)
+                if not bool(eligible.any()):
+                    valid_idx = torch.nonzero(next_mask, as_tuple=False).flatten()
+                    drop_idx = valid_idx[selected_conf[batch_idx, valid_idx].argmin()]
+                    next_mask[drop_idx] = False
+                    continue
+                pressure = pressure.masked_fill(~eligible, -1e6)
+                drop_class = int(pressure.argmax().item())
+                class_idx_tensor = torch.nonzero(
+                    next_mask & (pseudo[batch_idx] == drop_class),
+                    as_tuple=False,
+                ).flatten()
+                if class_idx_tensor.numel() == 0:
+                    valid_idx = torch.nonzero(next_mask, as_tuple=False).flatten()
+                    drop_idx = valid_idx[selected_conf[batch_idx, valid_idx].argmin()]
+                    next_mask[drop_idx] = False
+                    continue
+                drop_idx = class_idx_tensor[selected_conf[batch_idx, class_idx_tensor].argmin()]
+                next_mask[drop_idx] = False
+
+            if mode == "protected_rescue" and rescue_frac > 0.0:
+                rescue_budget = int(round(num_tokens * float(rescue_frac)))
+                rescue_budget = max(0, rescue_budget)
+                for _ in range(rescue_budget):
+                    class_counts = torch.stack(
+                        [((pseudo[batch_idx] == class_idx) & next_mask).sum() for class_idx in range(labels.shape[1])]
+                    ).to(torch.float32)
+                    class_frac = class_counts / float(num_tokens)
+                    deficit = target_fraction.to(class_frac.device) - class_frac
+                    present_mask = torch.zeros_like(deficit, dtype=torch.bool)
+                    for class_idx in present_classes.tolist():
+                        present_mask[class_idx] = True
+                    deficit = deficit.masked_fill(~present_mask, -1e6)
+                    rescue_class = int(deficit.argmax().item())
+                    if float(deficit[rescue_class].item()) <= float(target_slack):
+                        break
+                    add_idx = torch.nonzero(
+                        (~next_mask) & keep[batch_idx] & (pseudo[batch_idx] == rescue_class),
+                        as_tuple=False,
+                    ).flatten()
+                    if add_idx.numel() == 0:
+                        break
+                    add_token = add_idx[selected_conf[batch_idx, add_idx].argmax()]
+
+                    surplus = class_frac - target_fraction.to(class_frac.device)
+                    surplus[rescue_class] = -1e6
+                    surplus = surplus.masked_fill(~present_mask, -1e6)
+                    drop_class = int(surplus.argmax().item())
+                    if float(surplus[drop_class].item()) <= 0.0:
+                        break
+                    drop_idx = torch.nonzero(
+                        next_mask & (pseudo[batch_idx] == drop_class),
+                        as_tuple=False,
+                    ).flatten()
+                    if drop_idx.numel() == 0:
+                        break
+                    drop_token = drop_idx[selected_conf[batch_idx, drop_idx].argmin()]
+                    next_mask[drop_token] = False
+                    next_mask[add_token] = True
+            capped[batch_idx] = next_mask
+
+    before = keep.float().mean()
+    after = capped.float().mean()
+    return capped, {
+        "pseudo_cap_removed": float((before - after).clamp_min(0.0).detach().cpu()),
+        "pseudo_cap_target": max_frac,
+        "pseudo_cap_protect_floor": float(protect_floor_ratio),
+        "pseudo_cap_rescue": float(rescue_frac if mode == "protected_rescue" else 0.0),
+    }
+
+
+@torch.no_grad()
 def make_pseudo(
     logits: torch.Tensor,
     labels: torch.Tensor,
@@ -375,11 +566,19 @@ def make_pseudo(
     jepa_completed_mix_alpha: float = 0.5,
     jepa_completed_class_alpha: torch.Tensor | None = None,
     reliability_min: float = 0.0,
+    expand_affinity_alpha: float = 0.3,
+    expand_affinity_beta: float = 0.2,
+    expand_affinity_margin: float = 0.0,
     inhibition_mode: str = "none",
     inhibition_strength: float = 0.5,
     inhibition_margin: float = 0.05,
     inhibition_temperature: float = 0.05,
     inhibition_tokens: torch.Tensor | None = None,
+    kept_cap_max_frac: float = 1.0,
+    kept_cap_mode: str = "global",
+    kept_cap_target_slack: float = 0.02,
+    kept_cap_protect_floor_ratio: float = 0.5,
+    kept_cap_rescue_frac: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, object]]:
     if restrict_present:
         absent = labels <= 0
@@ -422,6 +621,8 @@ def make_pseudo(
     expanded = torch.zeros_like(keep)
     alpha_sum = torch.zeros((), device=logits.device, dtype=torch.float32)
     alpha_count = torch.zeros((), device=logits.device, dtype=torch.float32)
+    affinity_margin_sum = torch.zeros((), device=logits.device, dtype=torch.float32)
+    affinity_margin_count = torch.zeros((), device=logits.device, dtype=torch.float32)
     expand_min_frac = max(0.0, float(expand_min_frac))
     if expand_min_frac > 0.0:
         if expand_mode not in {
@@ -434,6 +635,8 @@ def make_pseudo(
             "minimal_mix_geometric",
             "adaptive_margin",
             "adaptive_margin_reliability",
+            "feature_affinity",
+            "feature_affinity_margin",
             "adaptive_margin_jepa",
             "adaptive_margin_jepa_completed",
         }:
@@ -451,9 +654,9 @@ def make_pseudo(
         adaptive_budget = (float(expand_min_frac) * under).clamp(0.0, float(expand_max_frac))
         adaptive_budget = torch.where(current_fraction_tensor < target_fraction, adaptive_budget, torch.zeros_like(adaptive_budget))
         norm_tokens = None
-        if expand_mode == "adaptive_margin_reliability":
+        if expand_mode in {"adaptive_margin_reliability", "feature_affinity", "feature_affinity_margin"}:
             if reliability_tokens is None:
-                raise ValueError("adaptive_margin_reliability requires reliability_tokens.")
+                raise ValueError(f"{expand_mode} requires reliability_tokens.")
             norm_tokens = F.normalize(reliability_tokens.detach().float(), dim=-1)
         if expand_mode == "adaptive_margin_jepa" and jepa_reliability is None:
             raise ValueError("adaptive_margin_jepa requires jepa_reliability.")
@@ -515,6 +718,8 @@ def make_pseudo(
                 if expand_mode in {
                     "adaptive_margin",
                     "adaptive_margin_reliability",
+                    "feature_affinity",
+                    "feature_affinity_margin",
                     "adaptive_margin_jepa",
                     "adaptive_margin_jepa_completed",
                 }:
@@ -540,6 +745,43 @@ def make_pseudo(
                 if expand_mode in {"adaptive_margin", "adaptive_margin_reliability"}:
                     rank_score = candidates * margins[batch_idx].clamp_min(0.0)
                     idx = rank_score.topk(topk).indices
+                elif expand_mode in {"feature_affinity", "feature_affinity_margin"} and norm_tokens is not None:
+                    seed_mask = (pseudo[batch_idx] == class_idx) & keep[batch_idx]
+                    if not bool(seed_mask.any()):
+                        rank_score = candidates * margins[batch_idx].clamp_min(0.0)
+                        idx = rank_score.topk(topk).indices
+                    else:
+                        token_bank = norm_tokens[batch_idx]
+                        centroid = F.normalize(token_bank[seed_mask].mean(dim=0), dim=0)
+                        own_affinity = torch.mv(token_bank, centroid).to(candidates.device, candidates.dtype)
+                        other_affinity = torch.zeros_like(own_affinity)
+                        other_count = 0
+                        for other_class in present_classes.tolist():
+                            if other_class == class_idx:
+                                continue
+                            other_seed = (pseudo[batch_idx] == other_class) & keep[batch_idx]
+                            if not bool(other_seed.any()):
+                                continue
+                            other_centroid = F.normalize(token_bank[other_seed].mean(dim=0), dim=0)
+                            other_score = torch.mv(token_bank, other_centroid).to(candidates.device, candidates.dtype)
+                            other_affinity = torch.maximum(other_affinity, other_score)
+                            other_count += 1
+                        affinity_margin = own_affinity - other_affinity if other_count > 0 else own_affinity
+                        if expand_mode == "feature_affinity_margin":
+                            candidates = candidates.masked_fill(affinity_margin < float(expand_affinity_margin), -1.0)
+                        rank_score = (
+                            candidates * margins[batch_idx].clamp_min(0.0)
+                            + float(expand_affinity_alpha) * own_affinity
+                            - float(expand_affinity_beta) * other_affinity
+                        )
+                        rank_score = rank_score.masked_fill(candidates < 0.0, -1.0)
+                        available = int((candidates >= 0.0).sum().item())
+                        if available <= 0:
+                            continue
+                        topk = min(topk, available)
+                        idx = rank_score.topk(topk).indices
+                        affinity_margin_sum = affinity_margin_sum + affinity_margin[idx].sum().float()
+                        affinity_margin_count = affinity_margin_count + float(topk)
                 elif expand_mode == "adaptive_margin_jepa" and jepa_reliability is not None:
                     rank_score = candidates * margins[batch_idx].clamp_min(0.0) * jepa_reliability[batch_idx].to(candidates.device, candidates.dtype)
                     idx = rank_score.topk(topk).indices
@@ -595,6 +837,18 @@ def make_pseudo(
                 pseudo[batch_idx, idx] = class_idx
                 keep[batch_idx, idx] = True
                 expanded[batch_idx, idx] = True
+    keep, cap_stats = cap_pseudo_keep(
+        keep,
+        pseudo,
+        probs,
+        labels,
+        kept_cap_max_frac,
+        kept_cap_mode,
+        kept_cap_target_slack,
+        kept_cap_protect_floor_ratio,
+        kept_cap_rescue_frac,
+    )
+    expanded = expanded & keep
     pseudo = pseudo.masked_fill(~keep, ignore_index)
     valid = pseudo != ignore_index
     per_class = []
@@ -605,6 +859,8 @@ def make_pseudo(
         "pseudo_class_fraction": per_class,
         "pseudo_expanded": float(expanded.float().mean().detach().cpu()),
         "jepa_expand_alpha": float((alpha_sum / alpha_count.clamp_min(1.0)).detach().cpu()) if expand_min_frac > 0.0 else 0.0,
+        "affinity_expand_margin": float((affinity_margin_sum / affinity_margin_count.clamp_min(1.0)).detach().cpu()) if expand_min_frac > 0.0 else 0.0,
+        **cap_stats,
         **inhibition_stats,
     }
     return pseudo, valid, stats
@@ -615,6 +871,7 @@ def partial_ce_loss(
     pseudo: torch.Tensor,
     ignore_index: int,
     class_weights: torch.Tensor | None = None,
+    normalize_by_weight: bool = True,
 ) -> torch.Tensor:
     valid = pseudo != ignore_index
     if not bool(valid.any()):
@@ -626,7 +883,133 @@ def partial_ce_loss(
     losses = F.cross_entropy(flat_logits, flat_pseudo.clamp_max(logits.shape[-1] - 1), reduction="none")
     flat_valid = flat_pseudo != ignore_index
     weights = class_weights.to(logits.device).gather(dim=0, index=flat_pseudo[flat_valid].clamp_min(0))
-    return (losses[flat_valid] * weights).sum() / weights.sum().clamp_min(1e-6)
+    if normalize_by_weight:
+        denom = weights.sum().clamp_min(1e-6)
+    else:
+        denom = flat_valid.float().sum().clamp_min(1e-6)
+    return (losses[flat_valid] * weights).sum() / denom
+
+
+def mask_pool_image_logits(
+    patch_logits: torch.Tensor,
+    size_weight: float,
+    size_lambda: float,
+    detach_mask: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    probs = patch_logits.float().softmax(dim=-1)
+    weights = probs.detach() if detach_mask else probs
+    denom = weights.sum(dim=1).clamp_min(1e-6)
+    pooled = (weights * patch_logits.float()).sum(dim=1) / denom
+    area = probs.mean(dim=1)
+    if size_weight != 0.0:
+        size_term = torch.log(area.clamp_min(1e-6) + float(size_lambda))
+        pooled = pooled + float(size_weight) * size_term
+    return pooled.to(patch_logits.dtype), area
+
+
+def select_patch_logits_for_mask_pool(outputs: dict[str, torch.Tensor], source: str) -> torch.Tensor:
+    if source == "output":
+        return outputs["patch_logits"]
+    if source == "spatial":
+        return outputs.get("spatial_patch_logits", outputs["patch_logits"])
+    if source == "semantic":
+        return outputs.get("semantic_patch_logits", outputs["patch_logits"])
+    raise ValueError(f"Unknown mask pool source: {source}")
+
+
+@torch.no_grad()
+def consistency_weights_from_stability(
+    teacher_logits: torch.Tensor,
+    strong_logits: torch.Tensor,
+    pseudo: torch.Tensor,
+    ignore_index: int,
+    score: str,
+    base_weights: torch.Tensor,
+    mode: str,
+    min_weight: float,
+    max_weight: float,
+    adaptive_floor: torch.Tensor | None = None,
+    adaptive_cap: torch.Tensor | None = None,
+) -> torch.Tensor:
+    base = base_weights.to(strong_logits.device, strong_logits.dtype)
+    if mode == "fixed":
+        return base
+    if score == "softmax":
+        teacher_probs = teacher_logits.float().softmax(dim=-1)
+        strong_probs = strong_logits.float().softmax(dim=-1)
+    elif score == "sigmoid":
+        teacher_probs = teacher_logits.float().sigmoid()
+        strong_probs = strong_logits.float().sigmoid()
+    else:
+        raise ValueError(f"Unknown pseudo score: {score}")
+
+    weights = []
+    for class_idx in range(strong_logits.shape[-1]):
+        mask = pseudo == class_idx
+        if not bool(mask.any()):
+            weights.append(base[class_idx])
+            continue
+        strong_mean = strong_probs[..., class_idx][mask].mean()
+        if mode == "strong_prob":
+            value = strong_mean
+        elif mode in {"ratio", "stability_ratio", "stability_cap"}:
+            teacher_mean = teacher_probs[..., class_idx][mask].mean().clamp_min(1e-6)
+            value = strong_mean / teacher_mean
+        else:
+            raise ValueError(f"Unknown consistency weight mode: {mode}")
+        class_min = float(min_weight)
+        if adaptive_floor is not None:
+            class_min = float(adaptive_floor.to(value.device)[class_idx].detach().cpu())
+        class_max = float(max_weight)
+        if adaptive_cap is not None:
+            class_max = float(adaptive_cap.to(value.device)[class_idx].detach().cpu())
+        class_max = max(class_min, class_max)
+        value = value.clamp(class_min, class_max).to(base.dtype)
+        weights.append(base[class_idx] * value)
+    return torch.stack(weights).clamp(0.0, float(max_weight))
+
+
+@torch.no_grad()
+def class_pseudo_agreement(
+    teacher_logits: torch.Tensor,
+    strong_logits: torch.Tensor,
+    pseudo: torch.Tensor,
+    ignore_index: int,
+    score: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if score == "softmax":
+        teacher_pred = teacher_logits.float().argmax(dim=-1)
+        strong_pred = strong_logits.float().argmax(dim=-1)
+    elif score == "sigmoid":
+        teacher_pred = teacher_logits.float().sigmoid().argmax(dim=-1)
+        strong_pred = strong_logits.float().sigmoid().argmax(dim=-1)
+    else:
+        raise ValueError(f"Unknown pseudo score: {score}")
+
+    num_classes = strong_logits.shape[-1]
+    agreement = torch.zeros(num_classes, device=strong_logits.device, dtype=torch.float32)
+    observed = torch.zeros(num_classes, device=strong_logits.device, dtype=torch.float32)
+    valid = pseudo != ignore_index
+    for class_idx in range(num_classes):
+        mask = valid & (pseudo == class_idx)
+        if bool(mask.any()):
+            agree = (teacher_pred[mask] == strong_pred[mask]).float().mean()
+            agreement[class_idx] = agree
+            observed[class_idx] = 1.0
+    return agreement, observed
+
+
+@torch.no_grad()
+def stability_floor_from_ema(
+    stability: torch.Tensor,
+    target: float,
+    temperature: float,
+    min_floor: float,
+    max_floor: float,
+) -> torch.Tensor:
+    temp = max(float(temperature), 1e-6)
+    floor = torch.sigmoid((stability.float() - float(target)) / temp)
+    return floor.clamp(float(min_floor), float(max_floor))
 
 
 def adaptive_thresholds_from_stats(
@@ -934,10 +1317,20 @@ def main() -> None:
     parser.add_argument("--min-lr-ratio", type=float, default=0.1)
     parser.add_argument("--class-balance", action="store_true")
     parser.add_argument("--max-pos-weight", type=float, default=3.0)
+    parser.add_argument("--image-logit-mode", default="semantic", choices=["semantic", "mask_pool", "mix"])
+    parser.add_argument("--mask-pool-source", default="output", choices=["output", "spatial", "semantic"])
+    parser.add_argument("--mask-pool-loss-weight", type=float, default=0.5)
+    parser.add_argument("--mask-pool-size-weight", type=float, default=0.1)
+    parser.add_argument("--mask-pool-size-lambda", type=float, default=0.05)
+    parser.add_argument("--mask-pool-detach-mask", action="store_true")
     parser.add_argument("--pseudo-weight", type=float, default=0.2)
+    parser.add_argument("--pseudo-warmup-epochs", type=float, default=0.0)
+    parser.add_argument("--pseudo-ramp-epochs", type=float, default=0.0)
     parser.add_argument("--pseudo-logit-target", default="spatial", choices=["spatial", "output"])
     parser.add_argument("--pseudo-score", default="softmax", choices=["softmax", "sigmoid"])
     parser.add_argument("--pseudo-thresholds", default="0.70")
+    parser.add_argument("--pseudo-thresholds-start", default="")
+    parser.add_argument("--pseudo-threshold-ramp-epochs", type=float, default=0.0)
     parser.add_argument("--pseudo-calibration", default="none", choices=["none", "bias", "bias_temp"])
     parser.add_argument("--pseudo-calibration-bias-strength", type=float, default=2.0)
     parser.add_argument("--pseudo-calibration-bias-max", type=float, default=0.5)
@@ -968,6 +1361,8 @@ def main() -> None:
             "minimal_mix_geometric",
             "adaptive_margin",
             "adaptive_margin_reliability",
+            "feature_affinity",
+            "feature_affinity_margin",
             "adaptive_margin_jepa",
             "adaptive_margin_jepa_completed",
         ],
@@ -975,10 +1370,15 @@ def main() -> None:
     parser.add_argument("--pseudo-expand-min-frac", type=float, default=0.0)
     parser.add_argument("--pseudo-expand-min-score", type=float, default=0.0)
     parser.add_argument("--pseudo-expand-max-frac", type=float, default=0.06)
+    parser.add_argument("--pseudo-expand-warmup-epochs", type=float, default=0.0)
+    parser.add_argument("--pseudo-expand-ramp-epochs", type=float, default=0.0)
     parser.add_argument("--pseudo-expand-margin-min", type=float, default=0.05)
     parser.add_argument("--pseudo-expand-under-strength", type=float, default=1.0)
     parser.add_argument("--pseudo-expand-reliability-layer", default="semantic", choices=["semantic", "spatial", "final"])
     parser.add_argument("--pseudo-expand-reliability-min", type=float, default=0.0)
+    parser.add_argument("--pseudo-expand-affinity-alpha", type=float, default=0.3)
+    parser.add_argument("--pseudo-expand-affinity-beta", type=float, default=0.2)
+    parser.add_argument("--pseudo-expand-affinity-margin", type=float, default=0.0)
     parser.add_argument("--jepa-reliability-checkpoint", default=None)
     parser.add_argument("--jepa-reliability-chunks", type=int, default=4)
     parser.add_argument("--jepa-reliability-scale", type=float, default=10.0)
@@ -989,6 +1389,11 @@ def main() -> None:
     parser.add_argument("--pseudo-class-weight-mode", default="none", choices=["none", "inverse_fraction"])
     parser.add_argument("--pseudo-class-weight-strength", type=float, default=0.5)
     parser.add_argument("--pseudo-class-weight-max", type=float, default=3.0)
+    parser.add_argument("--pseudo-kept-max-frac", type=float, default=1.0)
+    parser.add_argument("--pseudo-kept-cap-mode", default="global", choices=["global", "target", "protected", "protected_rescue"])
+    parser.add_argument("--pseudo-kept-cap-target-slack", type=float, default=0.02)
+    parser.add_argument("--pseudo-kept-cap-protect-floor-ratio", type=float, default=0.5)
+    parser.add_argument("--pseudo-kept-cap-rescue-frac", type=float, default=0.0)
     parser.add_argument("--restrict-present", action="store_true")
     parser.add_argument(
         "--teacher-mode",
@@ -1001,6 +1406,21 @@ def main() -> None:
     parser.add_argument("--teacher-source-temperature", type=float, default=1.0)
     parser.add_argument("--teacher-source-topk-frac", type=float, default=0.05)
     parser.add_argument("--teacher-source-area-penalty", type=float, default=0.5)
+    parser.add_argument("--strong-consistency-weight", type=float, default=0.0)
+    parser.add_argument("--consistency-warmup-epochs", type=float, default=0.0)
+    parser.add_argument("--consistency-ramp-epochs", type=float, default=0.0)
+    parser.add_argument("--consistency-class-weights", default="1.0")
+    parser.add_argument("--consistency-weight-mode", default="fixed", choices=["fixed", "strong_prob", "ratio", "stability_ratio", "stability_cap"])
+    parser.add_argument("--consistency-weight-min", type=float, default=0.0)
+    parser.add_argument("--consistency-weight-max", type=float, default=1.0)
+    parser.add_argument("--consistency-stability-ema", type=float, default=0.95)
+    parser.add_argument("--consistency-stability-target", type=float, default=0.70)
+    parser.add_argument("--consistency-stability-temp", type=float, default=0.10)
+    parser.add_argument("--consistency-floor-min", type=float, default=0.0)
+    parser.add_argument("--consistency-floor-max", type=float, default=1.0)
+    parser.add_argument("--strong-brightness", type=float, default=0.15)
+    parser.add_argument("--strong-contrast", type=float, default=0.25)
+    parser.add_argument("--strong-noise", type=float, default=0.03)
     parser.add_argument("--init-from-teacher", action="store_true")
     parser.add_argument("--spatial-route-mode", default="adaptive", choices=["adaptive", "fixed"])
     parser.add_argument("--fixed-spatial-layer", type=int, default=11)
@@ -1020,11 +1440,15 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     num_classes = len(CLASS_NAMES[args.dataset])
     thresholds = parse_thresholds(args.pseudo_thresholds, num_classes)
+    threshold_start = parse_thresholds(args.pseudo_thresholds_start, num_classes) if args.pseudo_thresholds_start.strip() else thresholds.clone()
     jepa_completed_class_alpha = parse_class_values(args.jepa_completed_class_alpha, num_classes, "--jepa-completed-class-alpha").to(device)
+    consistency_class_weights = parse_class_values(args.consistency_class_weights, num_classes, "--consistency-class-weights").to(device)
     image_mean, image_std = load_preprocessor_stats(args.checkpoint)
     print(f"image_mean={image_mean}", flush=True)
     print(f"image_std={image_std}", flush=True)
     print(f"teacher_mode={args.teacher_mode} pseudo_score={args.pseudo_score} thresholds={thresholds.tolist()}", flush=True)
+    print(f"threshold_start={threshold_start.tolist()}", flush=True)
+    print(f"consistency_class_weights={consistency_class_weights.detach().cpu().tolist()}", flush=True)
 
     train_set = ImageLevelDataset(args.data_root, args.dataset, transform=TrainTransform(image_mean, image_std))
     val_set = SegmentationDataset(
@@ -1144,22 +1568,44 @@ def main() -> None:
     global_step = 0
     log_path = output_dir / "log.csv"
     threshold_device = thresholds.to(device)
+    threshold_start_device = threshold_start.to(device)
+    consistency_stability_ema = torch.full((num_classes,), float(args.consistency_stability_target), device=device)
     for epoch in range(1, args.epochs + 1):
+        pseudo_scale = ramp_value(epoch, args.pseudo_warmup_epochs, args.pseudo_ramp_epochs)
+        consistency_scale = ramp_value(epoch, args.consistency_warmup_epochs, args.consistency_ramp_epochs)
+        expand_scale = ramp_value(epoch, args.pseudo_expand_warmup_epochs, args.pseudo_expand_ramp_epochs)
+        threshold_scale = ramp_value(epoch, args.pseudo_warmup_epochs, args.pseudo_threshold_ramp_epochs)
+        scheduled_pseudo_weight = float(args.pseudo_weight) * pseudo_scale
+        scheduled_consistency_weight = float(args.strong_consistency_weight) * consistency_scale
+        scheduled_thresholds = interpolate_thresholds(threshold_start_device, threshold_device, threshold_scale)
+        scheduled_expand_min_frac = float(args.pseudo_expand_min_frac) * expand_scale
+        scheduled_expand_max_frac = float(args.pseudo_expand_max_frac) * expand_scale
         model.train()
         start = time.perf_counter()
-        loss_sum = sem_sum = pseudo_sum = kept_sum = expanded_sum = 0.0
+        loss_sum = sem_sum = semantic_cls_sum = mask_pool_cls_sum = pseudo_sum = consistency_sum = kept_sum = expanded_sum = 0.0
+        cap_removed_sum = 0.0
+        cap_target_sum = 0.0
+        cap_floor_sum = 0.0
+        cap_rescue_sum = 0.0
         class_fraction_sum = torch.zeros(num_classes, dtype=torch.float64)
+        mask_pool_area_sum = torch.zeros(num_classes, dtype=torch.float64)
         threshold_sum = torch.zeros(num_classes, dtype=torch.float64)
         target_fraction_sum = torch.zeros(num_classes, dtype=torch.float64)
         pseudo_weight_sum = torch.zeros(num_classes, dtype=torch.float64)
         calibration_bias_sum = torch.zeros(num_classes, dtype=torch.float64)
         calibration_temp_sum = torch.zeros(num_classes, dtype=torch.float64)
         calibration_target_sum = torch.zeros(num_classes, dtype=torch.float64)
+        consistency_weight_sum = torch.zeros(num_classes, dtype=torch.float64)
+        consistency_effective_weight_sum = torch.zeros(num_classes, dtype=torch.float64)
+        consistency_stability_sum = torch.zeros(num_classes, dtype=torch.float64)
+        consistency_floor_sum = torch.zeros(num_classes, dtype=torch.float64)
+        consistency_agreement_sum = torch.zeros(num_classes, dtype=torch.float64)
         jepa_reliability_sum = 0.0
         jepa_error_sum = 0.0
         jepa_completed_conf_sum = 0.0
         jepa_completed_class_sum = torch.zeros(num_classes, dtype=torch.float64)
         jepa_expand_alpha_sum = 0.0
+        affinity_expand_margin_sum = 0.0
         inhibition_ambiguous_sum = 0.0
         inhibition_changed_sum = 0.0
         inhibition_drop_sum = 0.0
@@ -1198,7 +1644,7 @@ def main() -> None:
                     raw_pseudo, _raw_valid, raw_stats = make_pseudo(
                         teacher_logits,
                         labels,
-                        threshold_device,
+                        scheduled_thresholds,
                         args.pseudo_score,
                         args.restrict_present,
                         args.ignore_index,
@@ -1222,13 +1668,13 @@ def main() -> None:
                         args.pseudo_calibration_target_min_frac,
                     )
                     teacher_logits = apply_logit_calibration(teacher_logits, calibration_bias, calibration_temp)
-                effective_thresholds = threshold_device
+                effective_thresholds = scheduled_thresholds
                 target_fraction = torch.zeros(num_classes, device=device)
                 if args.adaptive_pseudo_thresholds:
                     prelim_pseudo, _prelim_valid, prelim_stats = make_pseudo(
                         teacher_logits,
                         labels,
-                        threshold_device,
+                        scheduled_thresholds,
                         args.pseudo_score,
                         args.restrict_present,
                         args.ignore_index,
@@ -1241,7 +1687,7 @@ def main() -> None:
                     del prelim_pseudo, _prelim_valid
                     prelim_fraction = torch.tensor(prelim_stats["pseudo_class_fraction"], device=device)
                     effective_thresholds, target_fraction = adaptive_thresholds_from_stats(
-                        threshold_device,
+                        scheduled_thresholds,
                         prelim_fraction,
                         labels,
                         args.adaptive_threshold_strength,
@@ -1253,8 +1699,11 @@ def main() -> None:
                 jepa_reliability = None
                 jepa_completed_probs = None
                 jepa_error_mean = torch.zeros((), device=device)
-                if args.pseudo_expand_mode == "adaptive_margin_reliability":
-                    reliability_tokens = select_reliability_tokens(outputs, args.pseudo_expand_reliability_layer)
+                if args.pseudo_expand_mode in {"adaptive_margin_reliability", "feature_affinity", "feature_affinity_margin"}:
+                    reliability_source = fixed_outputs if fixed_outputs is not None else (ema_outputs if ema_outputs is not None else outputs)
+                    reliability_tokens = select_reliability_tokens(reliability_source, args.pseudo_expand_reliability_layer)
+                    if reliability_tokens is None:
+                        raise RuntimeError("Could not select tokens for feature-affinity expansion.")
                 elif args.pseudo_expand_mode == "adaptive_margin_jepa":
                     if jepa_predictor is None:
                         raise RuntimeError("JEPA predictor was not initialized.")
@@ -1305,9 +1754,9 @@ def main() -> None:
                     args.restrict_present,
                     args.ignore_index,
                     args.pseudo_expand_mode,
-                    args.pseudo_expand_min_frac,
+                    scheduled_expand_min_frac,
                     args.pseudo_expand_min_score,
-                    args.pseudo_expand_max_frac,
+                    scheduled_expand_max_frac,
                     args.pseudo_expand_margin_min,
                     args.pseudo_expand_under_strength,
                     reliability_tokens,
@@ -1317,13 +1766,37 @@ def main() -> None:
                     args.jepa_completed_mix_alpha,
                     jepa_completed_class_alpha,
                     args.pseudo_expand_reliability_min,
+                    args.pseudo_expand_affinity_alpha,
+                    args.pseudo_expand_affinity_beta,
+                    args.pseudo_expand_affinity_margin,
                     args.pseudo_inhibition,
                     args.pseudo_inhibition_strength,
                     args.pseudo_inhibition_margin,
                     args.pseudo_inhibition_temperature,
                     inhibition_tokens,
+                    args.pseudo_kept_max_frac,
+                    args.pseudo_kept_cap_mode,
+                    args.pseudo_kept_cap_target_slack,
+                    args.pseudo_kept_cap_protect_floor_ratio,
+                    args.pseudo_kept_cap_rescue_frac,
                 )
-                sem_loss = multilabel_loss(outputs["semantic_image_logits"], labels, pos_weight=pos_weight)
+                semantic_cls_loss = multilabel_loss(outputs["semantic_image_logits"], labels, pos_weight=pos_weight)
+                mask_pool_loss = semantic_cls_loss * 0.0
+                mask_pool_area = torch.zeros(num_classes, device=device)
+                if args.image_logit_mode in {"mask_pool", "mix"}:
+                    mask_pool_logits, mask_pool_area = mask_pool_image_logits(
+                        select_patch_logits_for_mask_pool(outputs, args.mask_pool_source),
+                        args.mask_pool_size_weight,
+                        args.mask_pool_size_lambda,
+                        args.mask_pool_detach_mask,
+                    )
+                    mask_pool_loss = multilabel_loss(mask_pool_logits, labels, pos_weight=pos_weight)
+                if args.image_logit_mode == "semantic":
+                    sem_loss = semantic_cls_loss
+                elif args.image_logit_mode == "mask_pool":
+                    sem_loss = mask_pool_loss
+                else:
+                    sem_loss = semantic_cls_loss + float(args.mask_pool_loss_weight) * mask_pool_loss
                 pseudo_logits = outputs["patch_logits"] if args.pseudo_logit_target == "output" else outputs["spatial_patch_logits"]
                 pseudo_fraction = torch.tensor(pseudo_stats["pseudo_class_fraction"], device=device)
                 pseudo_class_weights = pseudo_class_weights_from_stats(
@@ -1333,7 +1806,77 @@ def main() -> None:
                     args.pseudo_class_weight_max,
                 )
                 pseudo_loss = partial_ce_loss(pseudo_logits, pseudo, args.ignore_index, pseudo_class_weights)
-                loss = sem_loss + float(args.pseudo_weight) * pseudo_loss
+                consistency_loss = pseudo_loss * 0.0
+                consistency_effective_weights = consistency_class_weights
+                consistency_agreement = torch.zeros(num_classes, device=device)
+                consistency_floor = torch.zeros(num_classes, device=device)
+                if scheduled_consistency_weight > 0.0:
+                    strong_images = strong_augment_tensor(
+                        images,
+                        args.strong_brightness,
+                        args.strong_contrast,
+                        args.strong_noise,
+                    )
+                    strong_outputs = model(strong_images)
+                    strong_logits = (
+                        strong_outputs["patch_logits"]
+                        if args.pseudo_logit_target == "output"
+                        else strong_outputs["spatial_patch_logits"]
+                    )
+                    adaptive_floor = None
+                    adaptive_cap = None
+                    if args.consistency_weight_mode in {"stability_ratio", "stability_cap"}:
+                        agreement, observed = class_pseudo_agreement(
+                            teacher_logits,
+                            strong_logits,
+                            pseudo,
+                            args.ignore_index,
+                            args.pseudo_score,
+                        )
+                        decay = max(0.0, min(1.0, float(args.consistency_stability_ema)))
+                        consistency_stability_ema = torch.where(
+                            observed > 0,
+                            consistency_stability_ema * decay + agreement * (1.0 - decay),
+                            consistency_stability_ema,
+                        )
+                        adaptive_bound = stability_floor_from_ema(
+                            consistency_stability_ema,
+                            args.consistency_stability_target,
+                            args.consistency_stability_temp,
+                            args.consistency_floor_min,
+                            args.consistency_floor_max,
+                        )
+                        if args.consistency_weight_mode == "stability_ratio":
+                            adaptive_floor = adaptive_bound
+                        else:
+                            adaptive_cap = adaptive_bound
+                        consistency_agreement = agreement
+                        consistency_floor = adaptive_bound
+                    consistency_effective_weights = consistency_weights_from_stability(
+                        teacher_logits,
+                        strong_logits,
+                        pseudo,
+                        args.ignore_index,
+                        args.pseudo_score,
+                        consistency_class_weights,
+                        args.consistency_weight_mode,
+                        args.consistency_weight_min,
+                        args.consistency_weight_max,
+                        adaptive_floor,
+                        adaptive_cap,
+                    )
+                    consistency_loss = partial_ce_loss(
+                        strong_logits,
+                        pseudo,
+                        args.ignore_index,
+                        consistency_effective_weights,
+                        normalize_by_weight=False,
+                    )
+                loss = (
+                    sem_loss
+                    + scheduled_pseudo_weight * pseudo_loss
+                    + scheduled_consistency_weight * consistency_loss
+                )
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
@@ -1344,21 +1887,38 @@ def main() -> None:
             global_step += 1
             loss_sum += float(loss.detach().cpu())
             sem_sum += float(sem_loss.detach().cpu())
+            semantic_cls_sum += float(semantic_cls_loss.detach().cpu())
+            mask_pool_cls_sum += float(mask_pool_loss.detach().cpu())
             pseudo_sum += float(pseudo_loss.detach().cpu())
+            consistency_sum += float(consistency_loss.detach().cpu())
             kept_sum += float(pseudo_stats["pseudo_kept"])
             expanded_sum += float(pseudo_stats["pseudo_expanded"])
+            cap_removed_sum += float(pseudo_stats.get("pseudo_cap_removed", 0.0))
+            cap_target_sum += float(pseudo_stats.get("pseudo_cap_target", 1.0))
+            cap_floor_sum += float(pseudo_stats.get("pseudo_cap_protect_floor", 0.0))
+            cap_rescue_sum += float(pseudo_stats.get("pseudo_cap_rescue", 0.0))
             jepa_expand_alpha_sum += float(pseudo_stats.get("jepa_expand_alpha", 0.0))
+            affinity_expand_margin_sum += float(pseudo_stats.get("affinity_expand_margin", 0.0))
             inhibition_ambiguous_sum += float(pseudo_stats.get("inhibition_ambiguous", 0.0))
             inhibition_changed_sum += float(pseudo_stats.get("inhibition_changed_winner", 0.0))
             inhibition_drop_sum += float(pseudo_stats.get("inhibition_score_drop", 0.0))
             inhibition_seed_sum += float(pseudo_stats.get("inhibition_seed_fraction", 0.0))
             inhibition_centroid_sum += float(pseudo_stats.get("inhibition_centroid_class_fraction", 0.0))
             class_fraction_sum += torch.tensor(pseudo_stats["pseudo_class_fraction"], dtype=torch.float64)
+            if mask_pool_area.ndim == 2:
+                mask_pool_area_sum += mask_pool_area.detach().mean(dim=0).cpu().double()
+            else:
+                mask_pool_area_sum += mask_pool_area.detach().cpu().double()
             threshold_sum += effective_thresholds.detach().cpu().double()
             target_fraction_sum += target_fraction.detach().cpu().double()
             calibration_bias_sum += calibration_bias.detach().cpu().double()
             calibration_temp_sum += calibration_temp.detach().cpu().double()
             calibration_target_sum += calibration_target.detach().cpu().double()
+            consistency_weight_sum += consistency_class_weights.detach().cpu().double()
+            consistency_effective_weight_sum += consistency_effective_weights.detach().cpu().double()
+            consistency_stability_sum += consistency_stability_ema.detach().cpu().double()
+            consistency_floor_sum += consistency_floor.detach().cpu().double()
+            consistency_agreement_sum += consistency_agreement.detach().cpu().double()
             if jepa_reliability is not None:
                 jepa_reliability_sum += float(jepa_reliability.mean().detach().cpu())
                 jepa_error_sum += float(jepa_error_mean.detach().cpu())
@@ -1375,14 +1935,28 @@ def main() -> None:
                 elapsed = time.perf_counter() - start
                 print(
                     f"epoch={epoch}/{args.epochs} step={step}/{len(train_loader)} "
-                    f"loss={loss.item():.4f} sem={sem_loss.item():.4f} pseudo={pseudo_loss.item():.4f} "
+                    f"loss={loss.item():.4f} sem={sem_loss.item():.4f} "
+                    f"sem_cls={semantic_cls_loss.item():.4f} mask_cls={mask_pool_loss.item():.4f} "
+                    f"mask_area={(mask_pool_area.detach().mean(dim=0) if mask_pool_area.ndim == 2 else mask_pool_area.detach()).cpu().tolist()} "
+                    f"pseudo={pseudo_loss.item():.4f} "
+                    f"cons={consistency_loss.item():.4f} "
+                    f"w_pseudo={scheduled_pseudo_weight:.3f} w_cons={scheduled_consistency_weight:.3f} "
+                    f"thr={scheduled_thresholds.detach().cpu().tolist()} "
+                    f"exp_min={scheduled_expand_min_frac:.3f} exp_max={scheduled_expand_max_frac:.3f} "
+                    f"cons_w={consistency_effective_weights.detach().cpu().tolist()} "
+                    f"cons_floor={consistency_floor.detach().cpu().tolist()} "
+                    f"cons_stab={consistency_stability_ema.detach().cpu().tolist()} "
                     f"kept={pseudo_stats['pseudo_kept']:.3f} expand={pseudo_stats['pseudo_expanded']:.3f} "
+                    f"cap_rm={float(pseudo_stats.get('pseudo_cap_removed', 0.0)):.3f} "
+                    f"cap_floor={float(pseudo_stats.get('pseudo_cap_protect_floor', 0.0)):.2f} "
+                    f"cap_rescue={float(pseudo_stats.get('pseudo_cap_rescue', 0.0)):.3f} "
                     f"inh_amb={float(pseudo_stats.get('inhibition_ambiguous', 0.0)):.3f} "
                     f"inh_chg={float(pseudo_stats.get('inhibition_changed_winner', 0.0)):.3f} "
                     f"inh_drop={float(pseudo_stats.get('inhibition_score_drop', 0.0)):.3f} "
                     f"inh_seed={float(pseudo_stats.get('inhibition_seed_fraction', 0.0)):.3f} "
                     f"inh_cent={float(pseudo_stats.get('inhibition_centroid_class_fraction', 0.0)):.3f} "
                     f"exp_alpha={float(pseudo_stats.get('jepa_expand_alpha', 0.0)):.3f} "
+                    f"aff_margin={float(pseudo_stats.get('affinity_expand_margin', 0.0)):.3f} "
                     f"jepa_rel={(float(jepa_reliability.mean().detach().cpu()) if jepa_reliability is not None else 0.0):.3f} "
                     f"jepa_comp={(float(jepa_completed_probs.max(dim=-1).values.mean().detach().cpu()) if jepa_completed_probs is not None else 0.0):.3f} "
                     f"lr={lr:.2e} elapsed={elapsed:.1f}s peak_mem={peak:.2f}GB",
@@ -1408,16 +1982,34 @@ def main() -> None:
             "global_step": global_step,
             "train_loss": loss_sum / max(1, len(train_loader)),
             "train_sem_loss": sem_sum / max(1, len(train_loader)),
+            "train_semantic_cls_loss": semantic_cls_sum / max(1, len(train_loader)),
+            "train_mask_pool_cls_loss": mask_pool_cls_sum / max(1, len(train_loader)),
             "train_pseudo_loss": pseudo_sum / max(1, len(train_loader)),
+            "train_consistency_loss": consistency_sum / max(1, len(train_loader)),
+            "scheduled_pseudo_weight": scheduled_pseudo_weight,
+            "scheduled_consistency_weight": scheduled_consistency_weight,
+            "scheduled_expand_min_frac": scheduled_expand_min_frac,
+            "scheduled_expand_max_frac": scheduled_expand_max_frac,
+            "scheduled_thresholds": scheduled_thresholds.detach().cpu().tolist(),
             "pseudo_kept": kept_sum / max(1, len(train_loader)),
             "pseudo_expanded": expanded_sum / max(1, len(train_loader)),
+            "pseudo_cap_removed": cap_removed_sum / max(1, len(train_loader)),
+            "pseudo_cap_target": cap_target_sum / max(1, len(train_loader)),
+            "pseudo_cap_protect_floor": cap_floor_sum / max(1, len(train_loader)),
+            "pseudo_cap_rescue": cap_rescue_sum / max(1, len(train_loader)),
             "pseudo_class_fraction": (class_fraction_sum / max(1, len(train_loader))).tolist(),
+            "mask_pool_area": (mask_pool_area_sum / max(1, len(train_loader))).tolist(),
             "pseudo_thresholds_effective": (threshold_sum / max(1, len(train_loader))).tolist(),
             "pseudo_target_fraction": (target_fraction_sum / max(1, len(train_loader))).tolist(),
             "pseudo_class_weights": (pseudo_weight_sum / max(1, len(train_loader))).tolist(),
             "pseudo_calibration_bias": (calibration_bias_sum / max(1, len(train_loader))).tolist(),
             "pseudo_calibration_temp": (calibration_temp_sum / max(1, len(train_loader))).tolist(),
             "pseudo_calibration_target": (calibration_target_sum / max(1, len(train_loader))).tolist(),
+            "consistency_class_weights": (consistency_weight_sum / max(1, len(train_loader))).tolist(),
+            "consistency_weights_effective": (consistency_effective_weight_sum / max(1, len(train_loader))).tolist(),
+            "consistency_stability_ema": (consistency_stability_sum / max(1, len(train_loader))).tolist(),
+            "consistency_adaptive_floor": (consistency_floor_sum / max(1, len(train_loader))).tolist(),
+            "consistency_batch_agreement": (consistency_agreement_sum / max(1, len(train_loader))).tolist(),
             "inhibition_ambiguous_mean": inhibition_ambiguous_sum / max(1, len(train_loader)),
             "inhibition_changed_winner_mean": inhibition_changed_sum / max(1, len(train_loader)),
             "inhibition_score_drop_mean": inhibition_drop_sum / max(1, len(train_loader)),
@@ -1428,6 +2020,7 @@ def main() -> None:
             "jepa_completed_conf_mean": jepa_completed_conf_sum / max(1, len(train_loader)),
             "jepa_completed_class_mean": (jepa_completed_class_sum / max(1, len(train_loader))).tolist(),
             "jepa_expand_alpha_mean": jepa_expand_alpha_sum / max(1, len(train_loader)),
+            "affinity_expand_margin_mean": affinity_expand_margin_sum / max(1, len(train_loader)),
             "sec_epoch": sec_epoch,
             "val_miou": val_metrics["miou"],
             "val_mdice": val_metrics["mdice"],
