@@ -16,6 +16,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from jepa_wsss.datasets import CLASS_NAMES, SegmentationDataset, pil_to_normalized_tensor
 from jepa_wsss.metrics import SegmentationMeter
 from jepa_wsss.models import DualRouteLinearWSSSModel, LinearWSSSModel, PrototypeWSSSModel
+from scripts.patch_embed_adapt import adapt_vit_patch_embed
 
 
 def parse_prototype_counts(value: object, num_classes: int) -> list[int] | None:
@@ -124,6 +125,8 @@ def main() -> None:
     dense_prototype_scale = int(saved_args.get("dense_prototype_scale", 1))
     patch_stride = saved_args.get("patch_stride")
     patch_stride = None if patch_stride is None else int(patch_stride)
+    patch_kernel = saved_args.get("patch_kernel")
+    patch_kernel = None if patch_kernel is None else int(patch_kernel)
     patch_padding = int(saved_args.get("patch_padding", 0))
     prototype_pooling = saved_args.get("prototype_pooling", "max")
     prototype_topk_frac = float(saved_args.get("prototype_topk_frac", 0.05))
@@ -153,6 +156,13 @@ def main() -> None:
             output_mode=saved_args.get("output_mode", "spatial"),
             output_fuse_alpha=float(saved_args.get("output_fuse_alpha", 0.5)),
             grad_checkpointing=False,
+        )
+        adapt_vit_patch_embed(
+            model,
+            patch_kernel=patch_kernel,
+            patch_stride=patch_stride,
+            patch_padding=patch_padding,
+            resample_scale=saved_args.get("patch_resample_scale", "area"),
         )
     elif saved_args.get("model_type") == "linear_wsss":
         model = LinearWSSSModel(

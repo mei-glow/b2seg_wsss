@@ -32,6 +32,7 @@ from jepa_wsss.jepa import JEPAPredictor, gather_tokens  # noqa: E402
 from jepa_wsss.losses import multilabel_loss  # noqa: E402
 from jepa_wsss.metrics import SegmentationMeter  # noqa: E402
 from jepa_wsss.models import DualRouteLinearWSSSModel  # noqa: E402
+from scripts.patch_embed_adapt import adapt_vit_patch_embed  # noqa: E402
 from scripts.evaluate_crf import build_model_from_checkpoint  # noqa: E402
 
 
@@ -546,6 +547,124 @@ def cap_pseudo_keep(
 
 
 @torch.no_grad()
+def compute_affinity_walk_scores(
+    probs: torch.Tensor,
+    labels: torch.Tensor,
+    pseudo: torch.Tensor,
+    keep: torch.Tensor,
+    tokens: torch.Tensor,
+    steps: int,
+    gamma: float,
+    self_loop: float,
+    contrast_beta: float,
+    restrict_present: bool,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    steps = max(1, int(steps))
+    gamma = max(0.1, float(gamma))
+    self_loop = max(0.0, float(self_loop))
+    contrast_beta = max(0.0, float(contrast_beta))
+
+    batch, num_tokens, num_classes = probs.shape
+    norm_tokens = F.normalize(tokens.detach().float(), dim=-1)
+    walked_batches = []
+    walk_score_sum = torch.zeros((), device=probs.device, dtype=torch.float32)
+    walk_score_count = torch.zeros((), device=probs.device, dtype=torch.float32)
+    for batch_idx in range(batch):
+        present_classes = torch.nonzero(labels[batch_idx] > 0, as_tuple=False).flatten()
+        if present_classes.numel() == 0:
+            walked_batches.append(torch.zeros(num_tokens, num_classes, device=probs.device, dtype=torch.float32))
+            continue
+
+        affinity = torch.mm(norm_tokens[batch_idx], norm_tokens[batch_idx].t()).clamp_min(0.0)
+        if gamma != 1.0:
+            affinity = affinity.pow(gamma)
+        if self_loop > 0.0:
+            affinity = affinity + torch.eye(num_tokens, device=affinity.device, dtype=affinity.dtype) * self_loop
+        transition = affinity / affinity.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+
+        seeds = torch.zeros(num_tokens, num_classes, device=probs.device, dtype=torch.float32)
+        for class_idx in present_classes.tolist():
+            seed_mask = (pseudo[batch_idx] == class_idx) & keep[batch_idx]
+            if bool(seed_mask.any()):
+                seeds[seed_mask, class_idx] = probs[batch_idx, seed_mask, class_idx].float().clamp_min(1e-6)
+        if float(seeds.sum().item()) <= 0.0:
+            walked_batches.append(torch.zeros(num_tokens, num_classes, device=probs.device, dtype=torch.float32))
+            continue
+
+        walked = seeds
+        for _ in range(steps):
+            walked = torch.mm(transition, walked)
+        walked = walked / walked.amax(dim=0, keepdim=True).clamp_min(1e-6)
+        if contrast_beta > 0.0 and num_classes > 1:
+            other = []
+            for class_idx in range(num_classes):
+                mask = torch.ones(num_classes, dtype=torch.bool, device=probs.device)
+                mask[class_idx] = False
+                other.append(walked[:, mask].max(dim=-1).values)
+            other_walked = torch.stack(other, dim=-1)
+            walked = (walked - contrast_beta * other_walked).clamp_min(0.0)
+        if restrict_present:
+            walked = walked.masked_fill(labels[batch_idx].view(1, -1) <= 0, 0.0)
+        walked_batches.append(walked)
+        seed_any = seeds.sum(dim=-1) > 0
+        if bool(seed_any.any()):
+            walk_score_sum = walk_score_sum + walked[seed_any].max(dim=-1).values.sum()
+            walk_score_count = walk_score_count + float(seed_any.sum().item())
+
+    walked_scores = torch.stack(walked_batches, dim=0)
+    return walked_scores.to(probs.dtype), {
+        "affinity_walk_delta": 0.0,
+        "affinity_walk_seed": float(keep.float().mean().detach().cpu()),
+        "affinity_walk_score": float((walk_score_sum / walk_score_count.clamp_min(1.0)).detach().cpu()),
+    }
+
+
+@torch.no_grad()
+def apply_affinity_walk_refinement(
+    probs: torch.Tensor,
+    labels: torch.Tensor,
+    pseudo: torch.Tensor,
+    keep: torch.Tensor,
+    tokens: torch.Tensor,
+    steps: int,
+    alpha: float,
+    gamma: float,
+    self_loop: float,
+    contrast_beta: float,
+    restrict_present: bool,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    alpha = max(0.0, min(1.0, float(alpha)))
+    if alpha <= 0.0:
+        return probs, {
+            "affinity_walk_delta": 0.0,
+            "affinity_walk_seed": float(keep.float().mean().detach().cpu()),
+            "affinity_walk_score": 0.0,
+        }
+    walked_scores, stats = compute_affinity_walk_scores(
+        probs,
+        labels,
+        pseudo,
+        keep,
+        tokens,
+        steps,
+        gamma,
+        self_loop,
+        contrast_beta,
+        restrict_present,
+    )
+    refined = (1.0 - alpha) * probs.float() + alpha * walked_scores.float()
+    if restrict_present:
+        refined = refined.masked_fill(labels[:, None, :] <= 0, 0.0)
+    delta = (refined.float() - probs.float()).abs().mean()
+    stats["affinity_walk_delta"] = float(delta.detach().cpu())
+    return refined.to(probs.dtype), {
+        "affinity_walk_delta": float(delta.detach().cpu()),
+        "affinity_walk_seed": stats["affinity_walk_seed"],
+        "affinity_walk_score": stats["affinity_walk_score"],
+    }
+
+
+@torch.no_grad()
 def make_pseudo(
     logits: torch.Tensor,
     labels: torch.Tensor,
@@ -562,6 +681,7 @@ def make_pseudo(
     reliability_tokens: torch.Tensor | None = None,
     jepa_reliability: torch.Tensor | None = None,
     jepa_completed_probs: torch.Tensor | None = None,
+    jepa_affinity_tokens: torch.Tensor | None = None,
     jepa_completed_min_score: float = 0.0,
     jepa_completed_mix_alpha: float = 0.5,
     jepa_completed_class_alpha: torch.Tensor | None = None,
@@ -579,6 +699,11 @@ def make_pseudo(
     kept_cap_target_slack: float = 0.02,
     kept_cap_protect_floor_ratio: float = 0.5,
     kept_cap_rescue_frac: float = 0.0,
+    affinity_walk_steps: int = 2,
+    affinity_walk_alpha: float = 0.4,
+    affinity_walk_gamma: float = 2.0,
+    affinity_walk_self_loop: float = 1.0,
+    affinity_walk_contrast_beta: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, object]]:
     if restrict_present:
         absent = labels <= 0
@@ -618,6 +743,49 @@ def make_pseudo(
     keep = conf >= class_thresholds
     if restrict_present:
         keep = keep & labels.gather(dim=1, index=pseudo.clamp_min(0)).bool()
+    affinity_walk_stats = {"affinity_walk_delta": 0.0, "affinity_walk_seed": 0.0, "affinity_walk_score": 0.0}
+    affinity_candidate_scores = None
+    if expand_mode in {"affinity_walk", "affinity_walk_contrast"}:
+        if reliability_tokens is None:
+            raise ValueError(f"{expand_mode} requires reliability_tokens.")
+        contrast_beta = affinity_walk_contrast_beta if expand_mode == "affinity_walk_contrast" else 0.0
+        probs, affinity_walk_stats = apply_affinity_walk_refinement(
+            probs,
+            labels,
+            pseudo,
+            keep,
+            reliability_tokens,
+            affinity_walk_steps,
+            affinity_walk_alpha,
+            affinity_walk_gamma,
+            affinity_walk_self_loop,
+            contrast_beta,
+            restrict_present,
+        )
+        conf, pseudo = probs.max(dim=-1)
+        class_thresholds = thresholds.to(logits.device).view(1, 1, -1).expand(logits.shape).gather(
+            dim=-1,
+            index=pseudo.unsqueeze(-1),
+        ).squeeze(-1)
+        keep = conf >= class_thresholds
+        if restrict_present:
+            keep = keep & labels.gather(dim=1, index=pseudo.clamp_min(0)).bool()
+    elif expand_mode in {"affinity_candidate", "affinity_candidate_contrast"}:
+        if reliability_tokens is None:
+            raise ValueError(f"{expand_mode} requires reliability_tokens.")
+        contrast_beta = affinity_walk_contrast_beta if expand_mode == "affinity_candidate_contrast" else 0.0
+        affinity_candidate_scores, affinity_walk_stats = compute_affinity_walk_scores(
+            probs,
+            labels,
+            pseudo,
+            keep,
+            reliability_tokens,
+            affinity_walk_steps,
+            affinity_walk_gamma,
+            affinity_walk_self_loop,
+            contrast_beta,
+            restrict_present,
+        )
     expanded = torch.zeros_like(keep)
     alpha_sum = torch.zeros((), device=logits.device, dtype=torch.float32)
     alpha_count = torch.zeros((), device=logits.device, dtype=torch.float32)
@@ -637,6 +805,16 @@ def make_pseudo(
             "adaptive_margin_reliability",
             "feature_affinity",
             "feature_affinity_margin",
+            "affinity_walk",
+            "affinity_walk_contrast",
+            "affinity_candidate",
+            "affinity_candidate_contrast",
+            "jepa_affinity",
+            "jepa_contrast",
+            "online_jepa_affinity",
+            "online_jepa_contrast",
+            "affinity_walk",
+            "affinity_walk_contrast",
             "adaptive_margin_jepa",
             "adaptive_margin_jepa_completed",
         }:
@@ -658,6 +836,10 @@ def make_pseudo(
             if reliability_tokens is None:
                 raise ValueError(f"{expand_mode} requires reliability_tokens.")
             norm_tokens = F.normalize(reliability_tokens.detach().float(), dim=-1)
+        if expand_mode in {"jepa_affinity", "jepa_contrast", "online_jepa_affinity", "online_jepa_contrast"}:
+            if jepa_affinity_tokens is None:
+                raise ValueError(f"{expand_mode} requires jepa_affinity_tokens.")
+            norm_tokens = F.normalize(jepa_affinity_tokens.detach().float(), dim=-1)
         if expand_mode == "adaptive_margin_jepa" and jepa_reliability is None:
             raise ValueError("adaptive_margin_jepa requires jepa_reliability.")
         jepa_completed_modes = {
@@ -720,6 +902,14 @@ def make_pseudo(
                     "adaptive_margin_reliability",
                     "feature_affinity",
                     "feature_affinity_margin",
+                    "jepa_affinity",
+                    "jepa_contrast",
+                    "online_jepa_affinity",
+                    "online_jepa_contrast",
+                    "affinity_walk",
+                    "affinity_walk_contrast",
+                    "affinity_candidate",
+                    "affinity_candidate_contrast",
                     "adaptive_margin_jepa",
                     "adaptive_margin_jepa_completed",
                 }:
@@ -742,10 +932,27 @@ def make_pseudo(
                 if available <= 0:
                     continue
                 topk = min(needed, available)
-                if expand_mode in {"adaptive_margin", "adaptive_margin_reliability"}:
+                if expand_mode in {"adaptive_margin", "adaptive_margin_reliability", "affinity_walk", "affinity_walk_contrast"}:
                     rank_score = candidates * margins[batch_idx].clamp_min(0.0)
                     idx = rank_score.topk(topk).indices
-                elif expand_mode in {"feature_affinity", "feature_affinity_margin"} and norm_tokens is not None:
+                elif expand_mode in {"affinity_candidate", "affinity_candidate_contrast"} and affinity_candidate_scores is not None:
+                    walked = affinity_candidate_scores[batch_idx, :, class_idx].to(candidates.device, candidates.dtype)
+                    rank_score = (
+                        candidates * margins[batch_idx].clamp_min(0.0)
+                        + float(expand_affinity_alpha) * walked
+                    )
+                    rank_score = rank_score.masked_fill(candidates < 0.0, -1.0)
+                    idx = rank_score.topk(topk).indices
+                    affinity_margin_sum = affinity_margin_sum + walked[idx].sum().float()
+                    affinity_margin_count = affinity_margin_count + float(topk)
+                elif expand_mode in {
+                    "feature_affinity",
+                    "feature_affinity_margin",
+                    "jepa_affinity",
+                    "jepa_contrast",
+                    "online_jepa_affinity",
+                    "online_jepa_contrast",
+                } and norm_tokens is not None:
                     seed_mask = (pseudo[batch_idx] == class_idx) & keep[batch_idx]
                     if not bool(seed_mask.any()):
                         rank_score = candidates * margins[batch_idx].clamp_min(0.0)
@@ -767,12 +974,17 @@ def make_pseudo(
                             other_affinity = torch.maximum(other_affinity, other_score)
                             other_count += 1
                         affinity_margin = own_affinity - other_affinity if other_count > 0 else own_affinity
-                        if expand_mode == "feature_affinity_margin":
+                        if expand_mode in {"feature_affinity_margin", "jepa_contrast", "online_jepa_contrast"}:
                             candidates = candidates.masked_fill(affinity_margin < float(expand_affinity_margin), -1.0)
+                        beta = (
+                            float(expand_affinity_beta)
+                            if expand_mode in {"feature_affinity", "feature_affinity_margin", "jepa_contrast", "online_jepa_contrast"}
+                            else 0.0
+                        )
                         rank_score = (
                             candidates * margins[batch_idx].clamp_min(0.0)
                             + float(expand_affinity_alpha) * own_affinity
-                            - float(expand_affinity_beta) * other_affinity
+                            - beta * other_affinity
                         )
                         rank_score = rank_score.masked_fill(candidates < 0.0, -1.0)
                         available = int((candidates >= 0.0).sum().item())
@@ -862,6 +1074,7 @@ def make_pseudo(
         "affinity_expand_margin": float((affinity_margin_sum / affinity_margin_count.clamp_min(1.0)).detach().cpu()) if expand_min_frac > 0.0 else 0.0,
         **cap_stats,
         **inhibition_stats,
+        **affinity_walk_stats,
     }
     return pseudo, valid, stats
 
@@ -1177,6 +1390,39 @@ def compute_jepa_completed_probs(
     return logits.softmax(dim=-1)
 
 
+@torch.no_grad()
+def compute_jepa_completed_tokens(
+    patch_tokens: torch.Tensor,
+    predictor: JEPAPredictor,
+    chunks: int,
+) -> torch.Tensor:
+    batch, num_patches, dim = patch_tokens.shape
+    chunks = max(1, min(int(chunks), num_patches))
+    indices = torch.arange(num_patches, device=patch_tokens.device)
+    completed = torch.zeros(batch, num_patches, dim, device=patch_tokens.device, dtype=patch_tokens.dtype)
+    for part in torch.chunk(indices, chunks):
+        mask_indices = part.view(1, -1).expand(batch, -1)
+        pred = predictor(patch_tokens.detach(), mask_indices)
+        completed.scatter_(dim=1, index=mask_indices.unsqueeze(-1).expand_as(pred), src=pred.to(completed.dtype))
+    return completed
+
+
+def online_jepa_prediction_loss(
+    patch_tokens: torch.Tensor,
+    predictor: JEPAPredictor,
+    mask_ratio: float,
+    train_backbone: bool,
+) -> torch.Tensor:
+    batch, num_patches, _dim = patch_tokens.shape
+    mask_count = max(1, min(num_patches, int(round(num_patches * float(mask_ratio)))))
+    scores = torch.rand(batch, num_patches, device=patch_tokens.device)
+    mask_indices = scores.topk(mask_count, dim=1).indices
+    context_tokens = patch_tokens if train_backbone else patch_tokens.detach()
+    pred = predictor(context_tokens, mask_indices)
+    target = gather_tokens(patch_tokens.detach(), mask_indices)
+    return F.smooth_l1_loss(pred.float(), target.float())
+
+
 def pseudo_class_weights_from_stats(
     pseudo_class_fraction: torch.Tensor,
     mode: str,
@@ -1306,6 +1552,10 @@ def main() -> None:
     parser.add_argument("--teacher-checkpoint", default=None, help="Optional fixed/initial teacher checkpoint.")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--route-layers", default="all")
+    parser.add_argument("--patch-kernel", type=int, default=None)
+    parser.add_argument("--patch-stride", type=int, default=None)
+    parser.add_argument("--patch-padding", type=int, default=0)
+    parser.add_argument("--patch-resample-scale", default="area", choices=["area", "none"])
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--val-batch-size", type=int, default=64)
@@ -1363,6 +1613,14 @@ def main() -> None:
             "adaptive_margin_reliability",
             "feature_affinity",
             "feature_affinity_margin",
+            "affinity_walk",
+            "affinity_walk_contrast",
+            "affinity_candidate",
+            "affinity_candidate_contrast",
+            "jepa_affinity",
+            "jepa_contrast",
+            "online_jepa_affinity",
+            "online_jepa_contrast",
             "adaptive_margin_jepa",
             "adaptive_margin_jepa_completed",
         ],
@@ -1379,6 +1637,11 @@ def main() -> None:
     parser.add_argument("--pseudo-expand-affinity-alpha", type=float, default=0.3)
     parser.add_argument("--pseudo-expand-affinity-beta", type=float, default=0.2)
     parser.add_argument("--pseudo-expand-affinity-margin", type=float, default=0.0)
+    parser.add_argument("--affinity-walk-steps", type=int, default=2)
+    parser.add_argument("--affinity-walk-alpha", type=float, default=0.4)
+    parser.add_argument("--affinity-walk-gamma", type=float, default=2.0)
+    parser.add_argument("--affinity-walk-self-loop", type=float, default=1.0)
+    parser.add_argument("--affinity-walk-contrast-beta", type=float, default=0.2)
     parser.add_argument("--jepa-reliability-checkpoint", default=None)
     parser.add_argument("--jepa-reliability-chunks", type=int, default=4)
     parser.add_argument("--jepa-reliability-scale", type=float, default=10.0)
@@ -1386,6 +1649,17 @@ def main() -> None:
     parser.add_argument("--jepa-completed-min-score", type=float, default=0.0)
     parser.add_argument("--jepa-completed-mix-alpha", type=float, default=0.5)
     parser.add_argument("--jepa-completed-class-alpha", default="0.5")
+    parser.add_argument("--online-jepa-weight", type=float, default=0.0)
+    parser.add_argument("--online-jepa-mask-ratio", type=float, default=0.25)
+    parser.add_argument("--online-jepa-predictor-dim", type=int, default=384)
+    parser.add_argument("--online-jepa-predictor-type", default="mean_mlp")
+    parser.add_argument("--online-jepa-predictor-heads", type=int, default=6)
+    parser.add_argument("--online-jepa-predictor-depth", type=int, default=2)
+    parser.add_argument("--online-jepa-predictor-dropout", type=float, default=0.0)
+    parser.add_argument("--online-jepa-train-backbone", action="store_true")
+    parser.add_argument("--online-jepa-loss-warmup-epochs", type=float, default=0.0)
+    parser.add_argument("--online-jepa-loss-ramp-epochs", type=float, default=0.0)
+    parser.add_argument("--online-jepa-expand-warmup-epochs", type=float, default=2.0)
     parser.add_argument("--pseudo-class-weight-mode", default="none", choices=["none", "inverse_fraction"])
     parser.add_argument("--pseudo-class-weight-strength", type=float, default=0.5)
     parser.add_argument("--pseudo-class-weight-max", type=float, default=3.0)
@@ -1487,6 +1761,15 @@ def main() -> None:
         output_fuse_alpha=args.output_fuse_alpha,
         grad_checkpointing=args.grad_checkpointing,
     ).to(device)
+    patch_info = adapt_vit_patch_embed(
+        model,
+        patch_kernel=args.patch_kernel,
+        patch_stride=args.patch_stride,
+        patch_padding=args.patch_padding,
+        resample_scale=args.patch_resample_scale,
+    )
+    if patch_info["patch_adapted"]:
+        print(f"patch_embed_adapt={patch_info}", flush=True)
     if args.init_from_teacher:
         if args.teacher_checkpoint is None:
             raise ValueError("--init-from-teacher requires --teacher-checkpoint")
@@ -1497,7 +1780,7 @@ def main() -> None:
     print(f"resolved_route_layers={model.route_layers}", flush=True)
 
     jepa_predictor = None
-    if args.pseudo_expand_mode in {
+    external_jepa_modes = {
         "adaptive_margin_jepa",
         "adaptive_margin_jepa_completed",
         "minimal_jepa",
@@ -1505,7 +1788,14 @@ def main() -> None:
         "minimal_mix_adaptive",
         "minimal_mix_class_adaptive",
         "minimal_mix_geometric",
-    }:
+        "jepa_affinity",
+        "jepa_contrast",
+    }
+    online_jepa_modes = {"online_jepa_affinity", "online_jepa_contrast"}
+    online_jepa_enabled = args.pseudo_expand_mode in online_jepa_modes or (
+        args.online_jepa_weight > 0.0 and args.pseudo_expand_mode not in external_jepa_modes
+    )
+    if args.pseudo_expand_mode in external_jepa_modes:
         if args.jepa_reliability_checkpoint is None:
             raise ValueError(f"--pseudo-expand-mode {args.pseudo_expand_mode} requires --jepa-reliability-checkpoint")
         jepa_predictor = build_jepa_predictor_from_checkpoint(
@@ -1513,6 +1803,22 @@ def main() -> None:
             model.num_features,
             model.num_patches,
             device,
+        )
+    elif online_jepa_enabled:
+        jepa_predictor = JEPAPredictor(
+            dim=model.num_features,
+            hidden_dim=int(args.online_jepa_predictor_dim),
+            num_patches=model.num_patches,
+            predictor_type=args.online_jepa_predictor_type,
+            num_heads=int(args.online_jepa_predictor_heads),
+            depth=int(args.online_jepa_predictor_depth),
+            dropout=float(args.online_jepa_predictor_dropout),
+        ).to(device)
+        print(
+            "online_jepa_predictor=created "
+            f"type={args.online_jepa_predictor_type} dim={args.online_jepa_predictor_dim} "
+            f"mask_ratio={args.online_jepa_mask_ratio}",
+            flush=True,
         )
 
     fixed_teacher = None
@@ -1539,7 +1845,10 @@ def main() -> None:
         for param in ema_teacher.parameters():
             param.requires_grad_(False)
 
-    optimizer = torch.optim.AdamW([param for param in model.parameters() if param.requires_grad], lr=args.lr, weight_decay=args.weight_decay)
+    trainable_params = [param for param in model.parameters() if param.requires_grad]
+    if jepa_predictor is not None and online_jepa_enabled:
+        trainable_params += [param for param in jepa_predictor.parameters() if param.requires_grad]
+    optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
     scheduler = build_scheduler(
         optimizer,
         args.scheduler,
@@ -1561,6 +1870,7 @@ def main() -> None:
     saved_args["image_mean"] = list(image_mean)
     saved_args["image_std"] = list(image_std)
     saved_args["class_names"] = CLASS_NAMES[args.dataset]
+    saved_args["patch_embed_info"] = patch_info
     (output_dir / "config.json").write_text(json.dumps(saved_args, indent=2), encoding="utf-8")
 
     best_miou = -1.0
@@ -1573,16 +1883,25 @@ def main() -> None:
     for epoch in range(1, args.epochs + 1):
         pseudo_scale = ramp_value(epoch, args.pseudo_warmup_epochs, args.pseudo_ramp_epochs)
         consistency_scale = ramp_value(epoch, args.consistency_warmup_epochs, args.consistency_ramp_epochs)
+        online_jepa_loss_scale = ramp_value(epoch, args.online_jepa_loss_warmup_epochs, args.online_jepa_loss_ramp_epochs)
         expand_scale = ramp_value(epoch, args.pseudo_expand_warmup_epochs, args.pseudo_expand_ramp_epochs)
         threshold_scale = ramp_value(epoch, args.pseudo_warmup_epochs, args.pseudo_threshold_ramp_epochs)
         scheduled_pseudo_weight = float(args.pseudo_weight) * pseudo_scale
         scheduled_consistency_weight = float(args.strong_consistency_weight) * consistency_scale
+        scheduled_online_jepa_weight = float(args.online_jepa_weight) * online_jepa_loss_scale
         scheduled_thresholds = interpolate_thresholds(threshold_start_device, threshold_device, threshold_scale)
         scheduled_expand_min_frac = float(args.pseudo_expand_min_frac) * expand_scale
         scheduled_expand_max_frac = float(args.pseudo_expand_max_frac) * expand_scale
+        active_expand_mode = args.pseudo_expand_mode
+        if args.pseudo_expand_mode in online_jepa_modes and epoch <= float(args.online_jepa_expand_warmup_epochs):
+            active_expand_mode = "fixed"
         model.train()
+        if jepa_predictor is not None:
+            jepa_predictor.train(online_jepa_enabled)
         start = time.perf_counter()
         loss_sum = sem_sum = semantic_cls_sum = mask_pool_cls_sum = pseudo_sum = consistency_sum = kept_sum = expanded_sum = 0.0
+        online_jepa_loss_sum = 0.0
+        online_jepa_weight_sum = 0.0
         cap_removed_sum = 0.0
         cap_target_sum = 0.0
         cap_floor_sum = 0.0
@@ -1606,6 +1925,9 @@ def main() -> None:
         jepa_completed_class_sum = torch.zeros(num_classes, dtype=torch.float64)
         jepa_expand_alpha_sum = 0.0
         affinity_expand_margin_sum = 0.0
+        affinity_walk_delta_sum = 0.0
+        affinity_walk_seed_sum = 0.0
+        affinity_walk_score_sum = 0.0
         inhibition_ambiguous_sum = 0.0
         inhibition_changed_sum = 0.0
         inhibition_drop_sum = 0.0
@@ -1617,6 +1939,17 @@ def main() -> None:
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type=device.type, enabled=args.amp and device.type == "cuda"):
                 outputs = model(images)
+                online_jepa_loss = outputs["patch_logits"].sum() * 0.0
+                if jepa_predictor is not None and online_jepa_enabled and scheduled_online_jepa_weight > 0.0:
+                    online_jepa_tokens = select_reliability_tokens(outputs, args.pseudo_expand_reliability_layer)
+                    if online_jepa_tokens is None:
+                        raise RuntimeError("Could not select tokens for online JEPA loss.")
+                    online_jepa_loss = online_jepa_prediction_loss(
+                        online_jepa_tokens,
+                        jepa_predictor,
+                        args.online_jepa_mask_ratio,
+                        args.online_jepa_train_backbone,
+                    )
                 fixed_outputs = fixed_teacher(images) if fixed_teacher is not None else None
                 ema_outputs = ema_teacher(images) if ema_teacher is not None else None
                 teacher_logits = teacher_logits_from_mode(
@@ -1698,13 +2031,22 @@ def main() -> None:
                 reliability_tokens = None
                 jepa_reliability = None
                 jepa_completed_probs = None
+                jepa_affinity_tokens = None
                 jepa_error_mean = torch.zeros((), device=device)
-                if args.pseudo_expand_mode in {"adaptive_margin_reliability", "feature_affinity", "feature_affinity_margin"}:
+                if active_expand_mode in {
+                    "adaptive_margin_reliability",
+                    "feature_affinity",
+                    "feature_affinity_margin",
+                    "affinity_walk",
+                    "affinity_walk_contrast",
+                    "affinity_candidate",
+                    "affinity_candidate_contrast",
+                }:
                     reliability_source = fixed_outputs if fixed_outputs is not None else (ema_outputs if ema_outputs is not None else outputs)
                     reliability_tokens = select_reliability_tokens(reliability_source, args.pseudo_expand_reliability_layer)
                     if reliability_tokens is None:
                         raise RuntimeError("Could not select tokens for feature-affinity expansion.")
-                elif args.pseudo_expand_mode == "adaptive_margin_jepa":
+                elif active_expand_mode == "adaptive_margin_jepa":
                     if jepa_predictor is None:
                         raise RuntimeError("JEPA predictor was not initialized.")
                     jepa_tokens = select_reliability_tokens(outputs, args.pseudo_expand_reliability_layer)
@@ -1717,7 +2059,18 @@ def main() -> None:
                         args.jepa_reliability_scale,
                     )
                     jepa_error_mean = jepa_error.mean()
-                elif args.pseudo_expand_mode in {
+                elif active_expand_mode in {"jepa_affinity", "jepa_contrast", "online_jepa_affinity", "online_jepa_contrast"}:
+                    if jepa_predictor is None:
+                        raise RuntimeError("JEPA predictor was not initialized.")
+                    jepa_tokens = select_reliability_tokens(outputs, args.pseudo_expand_reliability_layer)
+                    if jepa_tokens is None:
+                        raise RuntimeError("Could not select tokens for JEPA affinity expansion.")
+                    jepa_affinity_tokens = compute_jepa_completed_tokens(
+                        jepa_tokens,
+                        jepa_predictor,
+                        args.jepa_reliability_chunks,
+                    )
+                elif active_expand_mode in {
                     "adaptive_margin_jepa_completed",
                     "minimal_jepa",
                     "minimal_mix",
@@ -1753,7 +2106,7 @@ def main() -> None:
                     args.pseudo_score,
                     args.restrict_present,
                     args.ignore_index,
-                    args.pseudo_expand_mode,
+                    active_expand_mode,
                     scheduled_expand_min_frac,
                     args.pseudo_expand_min_score,
                     scheduled_expand_max_frac,
@@ -1762,6 +2115,7 @@ def main() -> None:
                     reliability_tokens,
                     jepa_reliability,
                     jepa_completed_probs,
+                    jepa_affinity_tokens,
                     args.jepa_completed_min_score,
                     args.jepa_completed_mix_alpha,
                     jepa_completed_class_alpha,
@@ -1779,6 +2133,11 @@ def main() -> None:
                     args.pseudo_kept_cap_target_slack,
                     args.pseudo_kept_cap_protect_floor_ratio,
                     args.pseudo_kept_cap_rescue_frac,
+                    args.affinity_walk_steps,
+                    args.affinity_walk_alpha,
+                    args.affinity_walk_gamma,
+                    args.affinity_walk_self_loop,
+                    args.affinity_walk_contrast_beta,
                 )
                 semantic_cls_loss = multilabel_loss(outputs["semantic_image_logits"], labels, pos_weight=pos_weight)
                 mask_pool_loss = semantic_cls_loss * 0.0
@@ -1876,6 +2235,7 @@ def main() -> None:
                     sem_loss
                     + scheduled_pseudo_weight * pseudo_loss
                     + scheduled_consistency_weight * consistency_loss
+                    + scheduled_online_jepa_weight * online_jepa_loss
                 )
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -1891,6 +2251,8 @@ def main() -> None:
             mask_pool_cls_sum += float(mask_pool_loss.detach().cpu())
             pseudo_sum += float(pseudo_loss.detach().cpu())
             consistency_sum += float(consistency_loss.detach().cpu())
+            online_jepa_loss_sum += float(online_jepa_loss.detach().cpu())
+            online_jepa_weight_sum += float(scheduled_online_jepa_weight)
             kept_sum += float(pseudo_stats["pseudo_kept"])
             expanded_sum += float(pseudo_stats["pseudo_expanded"])
             cap_removed_sum += float(pseudo_stats.get("pseudo_cap_removed", 0.0))
@@ -1899,6 +2261,9 @@ def main() -> None:
             cap_rescue_sum += float(pseudo_stats.get("pseudo_cap_rescue", 0.0))
             jepa_expand_alpha_sum += float(pseudo_stats.get("jepa_expand_alpha", 0.0))
             affinity_expand_margin_sum += float(pseudo_stats.get("affinity_expand_margin", 0.0))
+            affinity_walk_delta_sum += float(pseudo_stats.get("affinity_walk_delta", 0.0))
+            affinity_walk_seed_sum += float(pseudo_stats.get("affinity_walk_seed", 0.0))
+            affinity_walk_score_sum += float(pseudo_stats.get("affinity_walk_score", 0.0))
             inhibition_ambiguous_sum += float(pseudo_stats.get("inhibition_ambiguous", 0.0))
             inhibition_changed_sum += float(pseudo_stats.get("inhibition_changed_winner", 0.0))
             inhibition_drop_sum += float(pseudo_stats.get("inhibition_score_drop", 0.0))
@@ -1940,7 +2305,10 @@ def main() -> None:
                     f"mask_area={(mask_pool_area.detach().mean(dim=0) if mask_pool_area.ndim == 2 else mask_pool_area.detach()).cpu().tolist()} "
                     f"pseudo={pseudo_loss.item():.4f} "
                     f"cons={consistency_loss.item():.4f} "
+                    f"online_jepa={online_jepa_loss.item():.4f} "
                     f"w_pseudo={scheduled_pseudo_weight:.3f} w_cons={scheduled_consistency_weight:.3f} "
+                    f"w_online_jepa={scheduled_online_jepa_weight:.3f} "
+                    f"expand_mode={active_expand_mode} "
                     f"thr={scheduled_thresholds.detach().cpu().tolist()} "
                     f"exp_min={scheduled_expand_min_frac:.3f} exp_max={scheduled_expand_max_frac:.3f} "
                     f"cons_w={consistency_effective_weights.detach().cpu().tolist()} "
@@ -1957,6 +2325,8 @@ def main() -> None:
                     f"inh_cent={float(pseudo_stats.get('inhibition_centroid_class_fraction', 0.0)):.3f} "
                     f"exp_alpha={float(pseudo_stats.get('jepa_expand_alpha', 0.0)):.3f} "
                     f"aff_margin={float(pseudo_stats.get('affinity_expand_margin', 0.0)):.3f} "
+                    f"affwalk_delta={float(pseudo_stats.get('affinity_walk_delta', 0.0)):.3f} "
+                    f"affwalk_score={float(pseudo_stats.get('affinity_walk_score', 0.0)):.3f} "
                     f"jepa_rel={(float(jepa_reliability.mean().detach().cpu()) if jepa_reliability is not None else 0.0):.3f} "
                     f"jepa_comp={(float(jepa_completed_probs.max(dim=-1).values.mean().detach().cpu()) if jepa_completed_probs is not None else 0.0):.3f} "
                     f"lr={lr:.2e} elapsed={elapsed:.1f}s peak_mem={peak:.2f}GB",
@@ -1986,8 +2356,11 @@ def main() -> None:
             "train_mask_pool_cls_loss": mask_pool_cls_sum / max(1, len(train_loader)),
             "train_pseudo_loss": pseudo_sum / max(1, len(train_loader)),
             "train_consistency_loss": consistency_sum / max(1, len(train_loader)),
+            "train_online_jepa_loss": online_jepa_loss_sum / max(1, len(train_loader)),
             "scheduled_pseudo_weight": scheduled_pseudo_weight,
             "scheduled_consistency_weight": scheduled_consistency_weight,
+            "scheduled_online_jepa_weight": scheduled_online_jepa_weight,
+            "active_expand_mode": active_expand_mode,
             "scheduled_expand_min_frac": scheduled_expand_min_frac,
             "scheduled_expand_max_frac": scheduled_expand_max_frac,
             "scheduled_thresholds": scheduled_thresholds.detach().cpu().tolist(),
@@ -2021,6 +2394,9 @@ def main() -> None:
             "jepa_completed_class_mean": (jepa_completed_class_sum / max(1, len(train_loader))).tolist(),
             "jepa_expand_alpha_mean": jepa_expand_alpha_sum / max(1, len(train_loader)),
             "affinity_expand_margin_mean": affinity_expand_margin_sum / max(1, len(train_loader)),
+            "affinity_walk_delta_mean": affinity_walk_delta_sum / max(1, len(train_loader)),
+            "affinity_walk_seed_mean": affinity_walk_seed_sum / max(1, len(train_loader)),
+            "affinity_walk_score_mean": affinity_walk_score_sum / max(1, len(train_loader)),
             "sec_epoch": sec_epoch,
             "val_miou": val_metrics["miou"],
             "val_mdice": val_metrics["mdice"],
@@ -2047,6 +2423,8 @@ def main() -> None:
             "epoch": epoch,
             "routes": routes,
         }
+        if jepa_predictor is not None:
+            state["predictor"] = jepa_predictor.state_dict()
         torch.save(state, output_dir / "last.pt")
         if float(val_metrics["miou"]) > best_miou:
             best_miou = float(val_metrics["miou"])

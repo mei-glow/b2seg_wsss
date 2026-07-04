@@ -30,6 +30,7 @@ from jepa_wsss.datasets import (
 from jepa_wsss.losses import multilabel_loss
 from jepa_wsss.metrics import SegmentationMeter
 from jepa_wsss.models import DualRouteLinearWSSSModel
+from scripts.patch_embed_adapt import adapt_vit_patch_embed
 
 
 class TrainTransform:
@@ -210,6 +211,10 @@ def main() -> None:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--variant", required=True, choices=["single_semantic", "single_spatial", "dual_param", "dual_quality", "dual_shift"])
     parser.add_argument("--route-layers", default="all")
+    parser.add_argument("--patch-kernel", type=int, default=None)
+    parser.add_argument("--patch-stride", type=int, default=None)
+    parser.add_argument("--patch-padding", type=int, default=0)
+    parser.add_argument("--patch-resample-scale", default="area", choices=["area", "none"])
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--val-batch-size", type=int, default=64)
@@ -276,6 +281,15 @@ def main() -> None:
         spatial_init=args.spatial_init,
         grad_checkpointing=args.grad_checkpointing,
     ).to(device)
+    patch_info = adapt_vit_patch_embed(
+        model,
+        patch_kernel=args.patch_kernel,
+        patch_stride=args.patch_stride,
+        patch_padding=args.patch_padding,
+        resample_scale=args.patch_resample_scale,
+    )
+    if patch_info["patch_adapted"]:
+        print(f"patch_embed_adapt={patch_info}", flush=True)
     print(f"resolved_route_layers={model.route_layers}", flush=True)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -302,6 +316,7 @@ def main() -> None:
     saved_args["image_mean"] = list(image_mean)
     saved_args["image_std"] = list(image_std)
     saved_args["class_names"] = CLASS_NAMES[args.dataset]
+    saved_args["patch_embed_info"] = patch_info
 
     for epoch in range(1, args.epochs + 1):
         model.train()

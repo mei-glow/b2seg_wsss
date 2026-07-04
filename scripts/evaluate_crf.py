@@ -17,6 +17,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from jepa_wsss.datasets import CLASS_NAMES, IMAGENET_MEAN, IMAGENET_STD, SegmentationDataset, pil_to_normalized_tensor
 from jepa_wsss.metrics import SegmentationMeter
 from jepa_wsss.models import DualRouteLinearWSSSModel, LinearWSSSModel, PrototypeWSSSModel
+from scripts.patch_embed_adapt import adapt_vit_patch_embed
 from scripts.evaluate import parse_prototype_counts
 
 
@@ -104,6 +105,9 @@ def build_model_from_checkpoint(checkpoint: dict[str, object], checkpoint_path: 
     )
     patch_stride = saved_args.get("patch_stride")
     patch_stride = None if patch_stride is None else int(patch_stride)
+    patch_kernel = saved_args.get("patch_kernel")
+    patch_kernel = None if patch_kernel is None else int(patch_kernel)
+    patch_padding = int(saved_args.get("patch_padding", 0))
     if saved_args.get("model_type") == "dual_route_linear":
         model = DualRouteLinearWSSSModel(
             model_name=model_name,
@@ -120,6 +124,13 @@ def build_model_from_checkpoint(checkpoint: dict[str, object], checkpoint_path: 
             output_fuse_alpha=float(saved_args.get("output_fuse_alpha", 0.5)),
             grad_checkpointing=False,
         )
+        adapt_vit_patch_embed(
+            model,
+            patch_kernel=patch_kernel,
+            patch_stride=patch_stride,
+            patch_padding=patch_padding,
+            resample_scale=saved_args.get("patch_resample_scale", "area"),
+        )
     elif saved_args.get("model_type") == "linear_wsss":
         model = LinearWSSSModel(
             model_name=model_name,
@@ -130,7 +141,7 @@ def build_model_from_checkpoint(checkpoint: dict[str, object], checkpoint_path: 
             fusion_mode=saved_args.get("fusion_mode", "weighted_sum"),
             fusion_init=saved_args.get("fusion_init", "average"),
             patch_stride=patch_stride,
-            patch_padding=int(saved_args.get("patch_padding", 0)),
+            patch_padding=patch_padding,
             pooling=saved_args.get("pooling", "max"),
             topk_frac=float(saved_args.get("topk_frac", 0.05)),
         )
