@@ -2,6 +2,8 @@
 data/*
 !data/.gitkeep
 runs/
+pretrained/*
+!pretrained/.gitkeep
 jepa_wsss/pretrained/*
 !jepa_wsss/pretrained/.gitkeep
 
@@ -15,6 +17,7 @@ jepa_wsss/pretrained/*
 # Local notes/plans/summaries
 *.md
 !README.md
+!analyze/bcss_training_label_counts.md
 
 # Python/cache artifacts
 __pycache__/
