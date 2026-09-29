@@ -1,0 +1,7 @@
+numpy<2
+pillow
+torch
+torchvision
+timm
+transformers
+safetensors
